@@ -1,0 +1,51 @@
+# blut-backends — the generic-LLM cookbook layer extracted from the BLUT
+# engine at the engine-only v1.0 carve. Holds the concrete generic-LLM
+# stages (materialize / filter / split / sft·dpo·distill train / merge_lora
+# / convert_gguf / register_model / eval_*) + the two concrete training
+# backends (HfTrainerBackend, LamuTrainerBackend) with their subprocess
+# runners, venv management, and backend-specific stages. Depends on the
+# `blut` framework crate (the engine: Stage / Plan / Recipe / Registry +
+# the job/status persistence schema it owns). Both cookbooks — blut-lamu
+# (generic LLM) and blut-lamquant (EEG codec, for its `hf_sft` recipe) —
+# depend on this crate. See [[project_blut_cookbook_split]].
+[package]
+name = "blut-backends"
+version = "0.1.0"
+edition = "2024"
+authors = ["Brian Lam"]
+license = "MIT"
+description = "Generic-LLM cookbook layer for BLUT — concrete stages + lamu/hf_trainer backends extracted from the engine."
+rust-version = "1.85"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Path-dep on the sibling `blut` engine submodule (`<meta>/blut`). The
+# moved stages/backends wire the engine primitives (framework, artifacts,
+# config, spec/protocol job schema, python_kill subprocess lifecycle,
+# paths, registry) via `blut::*`.
+blut = { path = "../blut" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+thiserror = "1"
+anyhow = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+parking_lot = "0.12"
+nix = { version = "0.29", features = ["signal", "process"] }
+dirs = "5"
+sha2 = "0.10"
+which = "6"
+rand = "0.8"
+# conversations.rs reads the lamu conversation DB; atomic JSONL writes
+# + several backend runners stage to a temp dir.
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"
+nix = { version = "0.29", features = ["signal", "process"] }
