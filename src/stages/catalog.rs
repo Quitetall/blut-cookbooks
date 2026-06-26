@@ -1,8 +1,8 @@
-//! Static stage catalog.
+//! Static ingredient catalog.
 //!
-//! Maps stage name → `Box<dyn StageDyn>` constructor so the
+//! Maps ingredient name → `Box<dyn StageDyn>` constructor so the
 //! `blut stage <name>` Unix-style invocation can locate the
-//! stage at runtime. Mirrors the `RECIPES` slice's shape.
+//! ingredient at runtime. Mirrors the `RECIPES` slice's shape.
 
 use blut::framework::stage::StageDyn;
 

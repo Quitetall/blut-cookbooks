@@ -9,7 +9,7 @@
 # (generic LLM) and blut-lamquant (EEG codec, for its `hf_sft` recipe) —
 # depend on this crate. See [[project_blut_cookbook_split]].
 [package]
-name = "blut-backends"
+name = "blut-cookbook-standard"
 version = "0.1.0"
 edition = "2024"
 authors = ["Brian Lam"]
@@ -20,12 +20,16 @@ rust-version = "1.85"
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "blut-standard"
+path = "src/main.rs"
+
 [dependencies]
-# Path-dep on the sibling `blut` engine submodule (`<meta>/blut`). The
+# Path-dep on the sibling `blut` engine submodule (`<meta>/training/engine`). The
 # moved stages/backends wire the engine primitives (framework, artifacts,
 # config, spec/protocol job schema, python_kill subprocess lifecycle,
 # paths, registry) via `blut::*`.
-blut = { path = "../blut" }
+blut = { path = "../engine" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

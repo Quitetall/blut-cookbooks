@@ -1,8 +1,8 @@
-//! Concrete stage catalog for BLUT.
+//! Concrete ingredient catalog for the standard ML cookbook.
 //!
 //! Each `pub mod` here implements `framework::Stage` for one
-//! atomic unit of work. Recipes (in `recipes/`) compose these
-//! into typed Plans.
+//! atomic unit of work (an *ingredient* in BLUT's cooking metaphor).
+//! Recipes compose these into typed Plans.
 //!
 //! v2 commit 4 ships the full SFT-from-conversations pipeline:
 //! materialize_conversations → filter_dataset → split_train_eval →
