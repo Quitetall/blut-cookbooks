@@ -94,21 +94,52 @@ impl TrainBackend for PythonTrainBackend {
         // Local spawns the trainer directly (byte-identical to the original);
         // Slurm/Ray wrap `python script spec` via the launcher (program/argv/env
         // are launcher data) but keep the SAME streaming + cancel path below.
+        //
+        // DDP: when nproc_per_node > 1, launch via `torchrun --nproc_per_node=N`
+        // instead of bare python, so the trainer auto-initializes DDP.
         use blut::config::launcher::{launcher_for, LaunchTarget};
+        let nproc = spec.nproc_per_node.max(1);
         let mut cmd = match self.launch_target {
             LaunchTarget::Local => {
                 let mut c = Command::new(&self.python);
+                if nproc > 1 {
+                    // DDP mode: launch via torchrun
+                    c.args([
+                        "-m", "torch.distributed.run",
+                        "--standalone",
+                        "--nproc_per_node", &nproc.to_string(),
+                    ]);
+                    if spec.nnodes > 1 {
+                        c.args(["--nnodes", &spec.nnodes.to_string()]);
+                    }
+                }
                 c.arg(&self.trainer_script).arg(&spec_json);
                 c
             }
             target => {
-                let inner = vec![
-                    self.python.display().to_string(),
+                let mut inner_args = vec![
                     self.trainer_script.display().to_string(),
                     spec_json.clone(),
                 ];
+                // For DDP on Slurm/Ray: prepend torchrun args
+                let inner_prog = if nproc > 1 {
+                    inner_args.insert(0, "torch.distributed.run".to_string());
+                    inner_args.insert(1, "--standalone".to_string());
+                    inner_args.insert(2, "--nproc_per_node".to_string());
+                    inner_args.insert(3, nproc.to_string());
+                    if spec.nnodes > 1 {
+                        inner_args.insert(4, "--nnodes".to_string());
+                        inner_args.insert(5, spec.nnodes.to_string());
+                    }
+                    inner_args.insert(0, "-m".to_string());
+                    self.python.display().to_string()
+                } else {
+                    self.python.display().to_string()
+                };
+                let mut full_inner = vec![inner_prog];
+                full_inner.extend(inner_args);
                 let w = launcher_for(target)
-                    .wrap("blut-train", &inner)
+                    .wrap("blut-train", &full_inner)
                     .map_err(|e| TrainError::other(format!("launcher wrap: {e}")))?;
                 let mut c = Command::new(&w.program);
                 c.args(&w.args);
@@ -118,6 +149,10 @@ impl TrainBackend for PythonTrainBackend {
                 c
             }
         };
+        // For DDP: don't pin CUDA_VISIBLE_DEVICES — torchrun manages LOCAL_RANK
+        if nproc <= 1 {
+            // Single-GPU: could pin device here if needed
+        }
         for (k, v) in &self.env {
             cmd.env(k, v);
         }
@@ -371,6 +406,8 @@ mod tests {
             quant: "Q4_K_M".into(),
             skip_convert: true,
             dpo_beta: None,
+            nproc_per_node: 1,
+            nnodes: 1,
         }
     }
 

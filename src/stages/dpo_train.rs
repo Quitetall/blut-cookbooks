@@ -86,6 +86,8 @@ impl Stage for DpoTrain {
             seed: args.seed,
             quant: "Q4_K_M".into(),
             skip_convert: true,
+            nproc_per_node: 1,
+            nnodes: 1,
             // Thread the DPO temperature through to the trainer (was dropped).
             dpo_beta: Some(args.beta),
         };

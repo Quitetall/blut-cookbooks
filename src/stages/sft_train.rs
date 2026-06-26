@@ -121,6 +121,8 @@ impl Stage for SftTrain {
             seed: args.seed,
             quant: "Q4_K_M".into(), // unused by the trainer; convert_gguf owns quant
             skip_convert: true,
+            nproc_per_node: 1,
+            nnodes: 1,
             dpo_beta: None,
         };
         spec.validate()
