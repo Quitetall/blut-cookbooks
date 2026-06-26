@@ -146,6 +146,8 @@ impl Recipe for FinetunePretrained {
                     seed: args.seed,
                     device: args.device.clone(),
                     lora_rank: None,
+                    nproc_per_node: 1,
+                    nnodes: 1,
                 },
             )
             .then(MergeLora, MergeArgs::default())

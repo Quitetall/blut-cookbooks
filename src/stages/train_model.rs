@@ -35,7 +35,7 @@ pub struct Args {
     pub step: IngredientCfg,
     /// Number of training epochs.
     pub epochs: u32,
-    /// Batch size.
+    /// Batch size per GPU.
     #[serde(default = "default_batch_size")]
     pub batch_size: u32,
     /// Random seed.
@@ -47,7 +47,16 @@ pub struct Args {
     /// Optional LoRA rank (if using lora_adapter model ingredient).
     #[serde(default)]
     pub lora_rank: Option<u32>,
+    /// Number of GPUs for DDP. 1 = single-GPU (default). >1 = torchrun DDP.
+    #[serde(default = "default_nproc")]
+    pub nproc_per_node: u32,
+    /// Number of DDP nodes (for multi-node). Default 1.
+    #[serde(default = "default_nnodes")]
+    pub nnodes: u32,
 }
+
+fn default_nproc() -> u32 { 1 }
+fn default_nnodes() -> u32 { 1 }
 
 fn default_step() -> IngredientCfg {
     IngredientCfg {
@@ -69,6 +78,17 @@ impl Stage for TrainModel {
     type Input = DatasetJsonl;
     type Output = HfCheckpoint;
     type Args = Args;
+
+    /// DDP: hold N GPU permits when nproc_per_node > 1.
+    fn gpu_permits(&self, args: &Args) -> u32 {
+        args.nproc_per_node.max(1)
+    }
+
+    /// DDP: scale memory reservation by nproc.
+    fn memory_gib_for(&self, args: &Args) -> u32 {
+        let base = Self::MEMORY_GIB.max(4);  // minimum 4 GiB per process
+        base * args.nproc_per_node.max(1)
+    }
 
     async fn run(
         &self,
@@ -117,17 +137,36 @@ impl Stage for TrainModel {
                 source,
             })?;
 
-        // Invoke the generic trainer
-        let status = std::process::Command::new("python3")
-            .args([
-                "-m", "blut_core.trainer",
-                "--config", config_path.to_str().unwrap(),
-            ])
-            .current_dir(&ctx.stage_dir)
-            .status()
-            .map_err(|e| StageError::Backend(
-                anyhow::anyhow!("failed to run blut_core.trainer: {}", e)
-            ))?;
+        // Invoke the generic trainer (via torchrun when DDP)
+        let nproc = args.nproc_per_node.max(1);
+        let mut cmd = std::process::Command::new("python3");
+        if nproc > 1 {
+            // DDP mode: launch via torchrun
+            cmd.args([
+                "-m", "torch.distributed.run",
+                "--standalone",
+                "--nproc_per_node", &nproc.to_string(),
+            ]);
+            if args.nnodes > 1 {
+                cmd.args(["--nnodes", &args.nnodes.to_string()]);
+            }
+        }
+        cmd.args([
+            "-m", "blut_core.trainer",
+            "--config", config_path.to_str().unwrap(),
+        ]);
+        cmd.current_dir(&ctx.stage_dir);
+
+        // For DDP: don't pin to a single device — torchrun manages LOCAL_RANK
+        if nproc <= 1 {
+            if let Some(dev) = ctx.device_index {
+                cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
+            }
+        }
+
+        let status = cmd.status().map_err(|e| StageError::Backend(
+            anyhow::anyhow!("failed to run blut_core.trainer: {}", e)
+        ))?;
 
         if !status.success() {
             return Err(StageError::Backend(
