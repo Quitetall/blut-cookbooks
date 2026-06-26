@@ -115,6 +115,7 @@ impl Stage for HfDpoTrain {
                 beta: args.beta,
                 preferences_path: None,
             }),
+            nproc_per_node: 1,
         };
 
         let status_tx = ctx.status_tx.clone();

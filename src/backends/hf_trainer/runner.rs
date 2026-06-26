@@ -71,7 +71,12 @@ pub struct HfTrainerJob {
     /// DPO-specific (ignored when task != "dpo").
     #[serde(default)]
     pub dpo: Option<DpoConfig>,
+    /// Number of GPUs for DDP. 1 = single-GPU (default). >1 = torchrun DDP.
+    #[serde(default = "default_nproc")]
+    pub nproc_per_node: u32,
 }
+
+fn default_nproc() -> u32 { 1 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeftConfig {
@@ -201,7 +206,16 @@ impl HfTrainerRunner {
             }
         };
 
+        // DDP: when nproc_per_node > 1, launch via torchrun
+        let nproc = job.nproc_per_node.max(1);
         let mut cmd = Command::new(&python);
+        if nproc > 1 {
+            cmd.args([
+                "-m", "torch.distributed.run",
+                "--standalone",
+                "--nproc_per_node", &nproc.to_string(),
+            ]);
+        }
         cmd.arg(&wrapper).arg(&spec_path);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -402,6 +416,7 @@ mod tests {
                 alpha: 32,
             }),
             dpo: None,
+            nproc_per_node: 1,
         };
         let s = serde_json::to_string(&job).unwrap();
         let back: HfTrainerJob = serde_json::from_str(&s).unwrap();

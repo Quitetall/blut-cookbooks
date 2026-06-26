@@ -152,6 +152,7 @@ impl Stage for HfSftTrain {
             extra: args.extra.clone(),
             peft,
             dpo: None,
+            nproc_per_node: 1,
         };
 
         // Fan tqdm-style step events into the executor's status
