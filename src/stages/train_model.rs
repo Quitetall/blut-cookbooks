@@ -139,16 +139,35 @@ impl Stage for TrainModel {
 
         // Invoke the generic trainer (via torchrun when DDP)
         let nproc = args.nproc_per_node.max(1);
+        let nnodes = args.nnodes.max(1);
         let mut cmd = std::process::Command::new("python3");
         if nproc > 1 {
             // DDP mode: launch via torchrun
-            cmd.args([
-                "-m", "torch.distributed.run",
-                "--standalone",
-                "--nproc_per_node", &nproc.to_string(),
-            ]);
-            if args.nnodes > 1 {
-                cmd.args(["--nnodes", &args.nnodes.to_string()]);
+            cmd.args(["-m", "torch.distributed.run"]);
+            if nnodes <= 1 {
+                // Single-node DDP
+                cmd.args(["--standalone", "--nproc_per_node", &nproc.to_string()]);
+            } else {
+                // Multi-node DDP: read rendezvous from env (set by Slurm launcher)
+                let master_addr = std::env::var("MASTER_ADDR")
+                    .unwrap_or_else(|_| {
+                        tracing::warn!("MASTER_ADDR not set for multi-node DDP, using 127.0.0.1");
+                        "127.0.0.1".into()
+                    });
+                let master_port = std::env::var("MASTER_PORT")
+                    .unwrap_or_else(|_| "29500".into());
+                let node_rank = std::env::var("NODE_RANK")
+                    .unwrap_or_else(|_| {
+                        tracing::warn!("NODE_RANK not set for multi-node DDP, using 0");
+                        "0".into()
+                    });
+                cmd.args([
+                    "--nnodes", &nnodes.to_string(),
+                    "--nproc_per_node", &nproc.to_string(),
+                    "--rdzv_backend", "c10d",
+                    "--rdzv_endpoint", &format!("{master_addr}:{master_port}"),
+                    "--node_rank", &node_rank,
+                ]);
             }
         }
         cmd.args([
