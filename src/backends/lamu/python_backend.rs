@@ -99,18 +99,31 @@ impl TrainBackend for PythonTrainBackend {
         // instead of bare python, so the trainer auto-initializes DDP.
         use blut::config::launcher::{launcher_for, LaunchTarget};
         let nproc = spec.nproc_per_node.max(1);
+        let nnodes = spec.nnodes.max(1);
         let mut cmd = match self.launch_target {
             LaunchTarget::Local => {
                 let mut c = Command::new(&self.python);
                 if nproc > 1 {
                     // DDP mode: launch via torchrun
-                    c.args([
-                        "-m", "torch.distributed.run",
-                        "--standalone",
-                        "--nproc_per_node", &nproc.to_string(),
-                    ]);
-                    if spec.nnodes > 1 {
-                        c.args(["--nnodes", &spec.nnodes.to_string()]);
+                    c.args(["-m", "torch.distributed.run"]);
+                    if nnodes <= 1 {
+                        // Single-node DDP
+                        c.args(["--standalone", "--nproc_per_node", &nproc.to_string()]);
+                    } else {
+                        // Multi-node DDP: read rendezvous from env
+                        let master_addr = std::env::var("MASTER_ADDR")
+                            .unwrap_or_else(|_| "127.0.0.1".into());
+                        let master_port = std::env::var("MASTER_PORT")
+                            .unwrap_or_else(|_| "29500".into());
+                        let node_rank = std::env::var("NODE_RANK")
+                            .unwrap_or_else(|_| "0".into());
+                        c.args([
+                            "--nnodes", &nnodes.to_string(),
+                            "--nproc_per_node", &nproc.to_string(),
+                            "--rdzv_backend", "c10d",
+                            "--rdzv_endpoint", &format!("{master_addr}:{master_port}"),
+                            "--node_rank", &node_rank,
+                        ]);
                     }
                 }
                 c.arg(&self.trainer_script).arg(&spec_json);
