@@ -123,9 +123,10 @@ def _fsdp_wrap_model(model):
 
 
 def _fsdp_full_state_dict(model):
-    """Gather a full (unsharded), CPU, rank-0-only state-dict from an FSDP2
-    model via the DCP state-dict API. Other ranks get an empty dict; callers
-    save on rank 0 only (the existing `_is_rank0()` guard)."""
+    """Gather a full (unsharded), CPU state-dict from an FSDP2 model via the DCP
+    state-dict API. This is a COLLECTIVE — every rank must call it — and with
+    `full_state_dict=True` each rank receives the full dict; callers then write
+    on rank 0 only (the existing `_is_rank0()` guard)."""
     from torch.distributed.checkpoint.state_dict import (
         get_model_state_dict,
         StateDictOptions,

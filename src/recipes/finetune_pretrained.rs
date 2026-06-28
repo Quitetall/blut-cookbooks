@@ -148,7 +148,7 @@ impl Recipe for FinetunePretrained {
                     lora_rank: None,
                     nproc_per_node: 1,
                     nnodes: 1,
-                    parallel_strategy: "ddp".into(), // single-GPU recipe; strategy is moot at nproc=1
+                    parallel_strategy: Default::default(), // Ddp; single-GPU recipe, moot at nproc=1
                 },
             )
             .then(MergeLora, MergeArgs::default())

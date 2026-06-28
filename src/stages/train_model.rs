@@ -53,16 +53,26 @@ pub struct Args {
     /// Number of DDP nodes (for multi-node). Default 1.
     #[serde(default = "default_nnodes")]
     pub nnodes: u32,
-    /// Multi-GPU parallel strategy: "ddp" (default, replicate) or "fsdp"
+    /// Multi-GPU parallel strategy: `Ddp` (default, replicate) or `Fsdp`
     /// (FSDP2 fully_shard — shard params/grads/optimizer state, ZeRO-3).
-    /// Only meaningful when nproc_per_node > 1.
-    #[serde(default = "default_parallel_strategy")]
-    pub parallel_strategy: String,
+    /// Only meaningful when nproc_per_node > 1. A typed enum so a typo is
+    /// rejected at deserialize time, not at the Python boundary.
+    #[serde(default)]
+    pub parallel_strategy: ParallelStrategy,
+}
+
+/// Multi-GPU parallel strategy. `Ddp` (default) replicates the model per rank;
+/// `Fsdp` (FSDP2 fully_shard) shards params/grads/optimizer state (ZeRO-3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ParallelStrategy {
+    #[default]
+    Ddp,
+    Fsdp,
 }
 
 fn default_nproc() -> u32 { 1 }
 fn default_nnodes() -> u32 { 1 }
-fn default_parallel_strategy() -> String { "ddp".to_string() }
 
 fn default_step() -> IngredientCfg {
     IngredientCfg {
@@ -241,7 +251,7 @@ mod tests {
             "epochs": 1,
         });
         let args: Args = serde_json::from_value(json).unwrap();
-        assert_eq!(args.parallel_strategy, "ddp");
+        assert_eq!(args.parallel_strategy, ParallelStrategy::Ddp);
         assert_eq!(args.nproc_per_node, 1);
     }
 
@@ -257,8 +267,16 @@ mod tests {
             "parallel_strategy": "fsdp",
         });
         let args: Args = serde_json::from_value(json).unwrap();
-        assert_eq!(args.parallel_strategy, "fsdp");
+        assert_eq!(args.parallel_strategy, ParallelStrategy::Fsdp);
         assert_eq!(args.nproc_per_node, 2);
+    }
+
+    #[test]
+    fn parallel_strategy_rejects_unknown() {
+        // A typo is caught by serde at deserialize, not deferred to Python.
+        let bad: Result<ParallelStrategy, _> =
+            serde_json::from_value(serde_json::json!("zero3"));
+        assert!(bad.is_err());
     }
 
     #[test]
