@@ -81,13 +81,15 @@ def _ddp_wrap_model(model):
     return model
 
 
-def _ddp_shard_dataset(dataset, batch_size: int, seed: int):
-    """Create a DistributedSampler and DataLoader for DDP."""
-    import torch
+def _ddp_shard_dataset(dataset, batch_size: int, seed: int, dl_kwargs: dict = None):
+    """Create a DistributedSampler and DataLoader for DDP. `dl_kwargs` carries
+    the async knobs (num_workers/prefetch_factor/pin_memory/persistent_workers);
+    when omitted, defaults to the old `num_workers=0, pin_memory=True`."""
     from torch.utils.data import DataLoader, DistributedSampler
+    if dl_kwargs is None:
+        dl_kwargs = {"num_workers": 0, "pin_memory": True}
     sampler = DistributedSampler(dataset, seed=seed, shuffle=True)
-    loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
-                        num_workers=0, pin_memory=True)
+    loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, **dl_kwargs)
     return sampler, loader
 
 
@@ -145,6 +147,171 @@ def _parallel_strategy(config: dict) -> str:
         raise ValueError(
             f"unknown parallel_strategy '{strat}' (expected 'ddp' or 'fsdp')")
     return strat
+
+
+# ---------------------------------------------------------------------------
+# Async compute (all opt-in via config; defaults reproduce the old behaviour)
+# ---------------------------------------------------------------------------
+#
+# The GPU stalls on three things: waiting for the next batch (decode/transfer),
+# the synchronous checkpoint write, and inline eval. These helpers overlap the
+# first two with compute. Each is gated by a config flag and defaults OFF, so an
+# unchanged config trains byte-for-byte as before.
+#
+# Async EVAL is intentionally NOT here: this generic trainer has no separate
+# eval phase (it emits one epoch metric inline), so there is nothing to overlap.
+# The valuable async-eval target is train_joint.py's `validate_joint`, which is
+# GPU-bound — truly overlapping it needs a weight snapshot + a second CUDA
+# stream, a larger change deferred to that trainer (see ADR 0065 follow-ups).
+
+def _dataloader_kwargs(config: dict) -> dict:
+    """DataLoader knobs from config. Defaults reproduce the old naive loader
+    (`num_workers=0`), so omitting them changes nothing. Set `num_workers > 0`
+    to decode on worker processes; `prefetch_factor`/`persistent_workers` then
+    overlap decode with the model step and avoid per-epoch worker re-forks."""
+    nw = int(config.get("num_workers", 0))
+    kw = {"num_workers": nw, "pin_memory": bool(config.get("pin_memory", False))}
+    if nw > 0:
+        # prefetch_factor / persistent_workers are only valid with workers > 0.
+        kw["prefetch_factor"] = int(config.get("prefetch_factor", 2))
+        kw["persistent_workers"] = bool(config.get("persistent_workers", True))
+    return kw
+
+
+class CudaPrefetcher:
+    """Double-buffer the next batch onto a side CUDA stream while the model
+    computes the current one. Hides the host→device copy behind compute.
+
+    Opt-in (`config["cuda_prefetch"]`); the call site only constructs it on a
+    CUDA device (`torch.cuda.is_available()`), so the constructor assumes CUDA.
+    Handles dict / list / tuple batches of tensors (recursively). Wraps an
+    existing DataLoader; the yielded batches are identical (same order, same
+    values, now on-device) — only the transfer timing changes, so the trained
+    result is unaffected."""
+
+    def __init__(self, loader, device):
+        import torch
+        self._loader = loader
+        self._device = device
+        self._stream = torch.cuda.Stream(device=device)
+        self._torch = torch
+
+    def _to_device(self, batch):
+        # Recurse through dict / list / tuple containers so a tuple batch
+        # (e.g. (input_ids, labels) from a custom collate) is transferred too,
+        # not silently left on CPU. Named tuples keep their type. `is_tensor`
+        # (not duck-typed `.to`) so an nn.Module in a batch isn't moved wholesale.
+        if self._torch.is_tensor(batch):
+            return batch.to(self._device, non_blocking=True)
+        if isinstance(batch, dict):
+            return {k: self._to_device(v) for k, v in batch.items()}
+        if isinstance(batch, (list, tuple)):
+            mapped = [self._to_device(v) for v in batch]
+            if isinstance(batch, tuple):
+                # Preserve namedtuple type (it takes positional args, not an iterable).
+                return type(batch)(*mapped) if hasattr(batch, "_fields") else tuple(mapped)
+            return mapped
+        return batch
+
+    def _record_stream(self, obj, stream):
+        # `record_stream` on EVERY tensor (any container) keeps the allocator
+        # from reusing the staging buffer before the default stream finishes
+        # reading it — a use-after-free guard that must not skip tuple batches.
+        if hasattr(obj, "record_stream"):
+            obj.record_stream(stream)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                self._record_stream(v, stream)
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                self._record_stream(v, stream)
+
+    def __iter__(self):
+        torch = self._torch
+        it = iter(self._loader)
+        try:
+            nxt = next(it)
+        except StopIteration:
+            return
+        with torch.cuda.stream(self._stream):
+            nxt = self._to_device(nxt)
+        while True:
+            # Make the default stream wait for the staging copy, then hand off
+            # the batch and stage the following one on the side stream.
+            torch.cuda.current_stream(self._device).wait_stream(self._stream)
+            cur = nxt
+            self._record_stream(cur, torch.cuda.current_stream(self._device))
+            try:
+                nxt = next(it)
+            except StopIteration:
+                yield cur
+                return
+            with torch.cuda.stream(self._stream):
+                nxt = self._to_device(nxt)
+            yield cur
+
+
+class AsyncCheckpointSaver:
+    """Offload `torch.save` off the training-loop thread. The state-dict is
+    snapshotted to CPU on the loop thread (cheap), then written by a single
+    background worker. At most one write is in flight: the next save joins the
+    previous one first, so writes never overlap or race the file.
+
+    Opt-in (`config["async_checkpoint"]`). `save_fn` is the same checkpoint
+    ingredient used synchronously; only the thread it runs on changes."""
+
+    def __init__(self, save_fn):
+        from concurrent.futures import ThreadPoolExecutor
+        self._save_fn = save_fn
+        self._pool = ThreadPoolExecutor(max_workers=1)
+        self._pending = None
+
+    @staticmethod
+    def _to_cpu(obj):
+        # Snapshot tensors to CPU so the background write sees a stable copy
+        # the training loop can't mutate underneath it. Recurse through dict /
+        # list / tuple so tensors nested in a list aren't left on the GPU
+        # (where the loop could mutate them mid-write). `is_tensor` (not
+        # duck-typed `.detach`) so only real tensors are copied.
+        import torch
+        if torch.is_tensor(obj):
+            return obj.detach().to("cpu", copy=True)
+        if isinstance(obj, dict):
+            return {k: AsyncCheckpointSaver._to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            mapped = [AsyncCheckpointSaver._to_cpu(v) for v in obj]
+            if isinstance(obj, tuple):
+                # Preserve namedtuple type (consistent with CudaPrefetcher._to_device).
+                return type(obj)(*mapped) if hasattr(obj, "_fields") else tuple(mapped)
+            return mapped
+        return obj
+
+    def save(self, payload, path):
+        if self._pending is not None:
+            # Bound to one in-flight write: join the previous before the next.
+            self._pending.result()
+        snapshot = self._to_cpu(payload)
+        self._pending = self._pool.submit(self._save_fn, snapshot, path)
+
+    def close(self):
+        """Join any in-flight write and shut the worker down. The pool is shut
+        down even if the join raises (a background save error), so the executor
+        never leaks; the error is re-raised after shutdown."""
+        try:
+            if self._pending is not None:
+                self._pending.result()  # may raise the background save's error
+                self._pending = None
+        finally:
+            self._pool.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        # Always join + shut down the pool, even if a save raised — so the
+        # ThreadPoolExecutor never leaks (this is the reusable primitive).
+        self.close()
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +482,23 @@ def train_loop(config: dict, ingredients: dict, dataset):
         dataloader = None  # handled inline
     else:
         batch_size = config.get("batch_size", 32)
+        dl_kwargs = _dataloader_kwargs(config)
         if ddp:
-            sampler, dataloader = _ddp_shard_dataset(dataset, batch_size, seed)
+            # Preserve the old DDP default (pin_memory=True) unless the config
+            # explicitly set pin_memory — otherwise existing DDP runs silently
+            # lose pinned H2D copies (a perf regression, not a correctness one).
+            if "pin_memory" not in config:
+                dl_kwargs["pin_memory"] = True
+            sampler, dataloader = _ddp_shard_dataset(dataset, batch_size, seed, dl_kwargs)
         else:
             dataloader = torch.utils.data.DataLoader(
-                dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+                dataset, batch_size=batch_size, shuffle=True, **dl_kwargs)
+        # Opt-in CUDA-stream prefetch: double-buffer the next batch onto a side
+        # stream while the model computes the current one (GPU only).
+        if (config.get("cuda_prefetch", False)
+                and not isinstance(dataset, list)
+                and str(device) != "cpu" and torch.cuda.is_available()):
+            dataloader = CudaPrefetcher(dataloader, device)
 
     # Training loop
     for epoch in range(1, epochs + 1):
@@ -398,7 +577,20 @@ def train_loop(config: dict, ingredients: dict, dataset):
 
     if _is_rank0():
         ckpt_path = output_dir / "model.pt"
-        save_fn({"model": model_state}, str(ckpt_path))
+        # Opt-in async checkpoint. NOTE: this trainer saves ONCE at the end, so
+        # here the async path is functionally a synchronous save (snapshot →
+        # write → join, with nothing left to overlap). AsyncCheckpointSaver is
+        # the reusable primitive; its overlap payoff lands in a trainer that
+        # saves DURING the loop (construct once, save() per epoch, close() at
+        # cleanup) — e.g. the train_joint integration. Kept wired here so the
+        # config flag + the primitive are exercised end-to-end.
+        if config.get("async_checkpoint", False):
+            # Context manager: close() (join + pool shutdown) always runs, even
+            # if save() raises — no ThreadPoolExecutor leak.
+            with AsyncCheckpointSaver(save_fn) as saver:
+                saver.save({"model": model_state}, str(ckpt_path))
+        else:
+            save_fn({"model": model_state}, str(ckpt_path))
         print(f"[trainer] checkpoint saved to {ckpt_path}")
 
         # Also save in HuggingFace format if possible. FSDP's sharded module
