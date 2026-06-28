@@ -97,6 +97,56 @@ def _ddp_unwrap(model):
 
 
 # ---------------------------------------------------------------------------
+# FSDP helpers (FSDP2 / fully_shard — torch >= 2.5)
+# ---------------------------------------------------------------------------
+#
+# FSDP2 shards parameters, gradients, and optimizer state across ranks
+# (ZeRO-3), trading NCCL traffic for memory so a model larger than one GPU's
+# VRAM can train. Unlike DDP it does NOT wrap the module in a `.module`
+# container — `fully_shard` mutates the module in place and registers its
+# sharded params, so unwrap is the identity and the saved state-dict must be
+# GATHERED via torch.distributed.checkpoint (DCP) rather than read directly.
+
+def _fsdp_wrap_model(model):
+    """Shard the model in place with FSDP2 fully_shard + bf16 mixed precision.
+
+    bf16 matches the LamQuant convention (stable on Ada/Hopper, no GradScaler).
+    `fully_shard` returns the same (now sharded) module object.
+    """
+    import torch
+    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+    local_rank = _ddp_local_rank()
+    model = model.to(f"cuda:{local_rank}")
+    mp = MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    fully_shard(model, mp_policy=mp)
+    return model
+
+
+def _fsdp_full_state_dict(model):
+    """Gather a full (unsharded), CPU, rank-0-only state-dict from an FSDP2
+    model via the DCP state-dict API. Other ranks get an empty dict; callers
+    save on rank 0 only (the existing `_is_rank0()` guard)."""
+    from torch.distributed.checkpoint.state_dict import (
+        get_model_state_dict,
+        StateDictOptions,
+    )
+    return get_model_state_dict(
+        model,
+        options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+    )
+
+
+def _parallel_strategy(config: dict) -> str:
+    """Read the parallel strategy from the config. 'ddp' (default) or 'fsdp'.
+    Only meaningful under torchrun (WORLD_SIZE > 1)."""
+    strat = str(config.get("parallel_strategy", "ddp")).lower()
+    if strat not in ("ddp", "fsdp"):
+        raise ValueError(
+            f"unknown parallel_strategy '{strat}' (expected 'ddp' or 'fsdp')")
+    return strat
+
+
+# ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
 
@@ -229,12 +279,18 @@ def train_loop(config: dict, ingredients: dict, dataset):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # DDP initialization
+    # Distributed initialization (DDP replicate, or FSDP2 shard)
     ddp = _is_ddp()
+    strategy = _parallel_strategy(config) if ddp else "ddp"
     if ddp:
         _ddp_init()
-        # DDP-wrap the model
-        model = _ddp_wrap_model(model)
+        # Wrap the model per strategy. Both wraps move it to the local GPU;
+        # the data-parallel axis (DistributedSampler + loss all-reduce) is
+        # identical — FSDP shards params, not the data dimension.
+        if strategy == "fsdp":
+            model = _fsdp_wrap_model(model)
+        else:
+            model = _ddp_wrap_model(model)
         # Create output dir (rank 0 only)
         if _is_rank0():
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -248,7 +304,8 @@ def train_loop(config: dict, ingredients: dict, dataset):
 
     if _is_rank0():
         print(f"[trainer] starting training: {epochs} epochs, "
-               f"device={device}, ddp={ddp}, world_size={_ddp_world_size()}")
+               f"device={device}, ddp={ddp}, strategy={strategy}, "
+               f"world_size={_ddp_world_size()}")
         print(f"[trainer] available ingredients: {list_ingredients()}")
 
     # Create dataloader
@@ -329,17 +386,25 @@ def train_loop(config: dict, ingredients: dict, dataset):
             emit(metrics, kind="epoch")
             print(f"[trainer] epoch {epoch}/{epochs}: loss={avg_loss:.4f}")
 
-    # Save checkpoint (rank 0 only)
-    if _is_rank0():
-        # Unwrap DDP to get base model
+    # Save checkpoint. For FSDP the state-dict GATHER is a collective — every
+    # rank must call it — but only rank 0 holds the full dict and writes.
+    if strategy == "fsdp":
+        model_state = _fsdp_full_state_dict(model)  # collective; all ranks
+        base_model = _ddp_unwrap(model)  # identity for FSDP (no .module)
+    else:
         base_model = _ddp_unwrap(model) if ddp else model
+        model_state = base_model.state_dict() if _is_rank0() else None
+
+    if _is_rank0():
         ckpt_path = output_dir / "model.pt"
-        save_fn({"model": base_model.state_dict()}, str(ckpt_path))
+        save_fn({"model": model_state}, str(ckpt_path))
         print(f"[trainer] checkpoint saved to {ckpt_path}")
 
-        # Also save in HuggingFace format if possible
+        # Also save in HuggingFace format if possible. FSDP's sharded module
+        # can't `save_pretrained` directly (params are DTensors); skip it —
+        # the gathered model.pt above is the portable artifact.
         try:
-            if hasattr(base_model, 'save_pretrained'):
+            if strategy != "fsdp" and hasattr(base_model, 'save_pretrained'):
                 hf_dir = output_dir / "hf"
                 base_model.save_pretrained(str(hf_dir))
                 print(f"[trainer] HF checkpoint saved to {hf_dir}")

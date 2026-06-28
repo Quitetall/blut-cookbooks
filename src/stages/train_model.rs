@@ -53,10 +53,16 @@ pub struct Args {
     /// Number of DDP nodes (for multi-node). Default 1.
     #[serde(default = "default_nnodes")]
     pub nnodes: u32,
+    /// Multi-GPU parallel strategy: "ddp" (default, replicate) or "fsdp"
+    /// (FSDP2 fully_shard — shard params/grads/optimizer state, ZeRO-3).
+    /// Only meaningful when nproc_per_node > 1.
+    #[serde(default = "default_parallel_strategy")]
+    pub parallel_strategy: String,
 }
 
 fn default_nproc() -> u32 { 1 }
 fn default_nnodes() -> u32 { 1 }
+fn default_parallel_strategy() -> String { "ddp".to_string() }
 
 fn default_step() -> IngredientCfg {
     IngredientCfg {
@@ -129,6 +135,7 @@ impl Stage for TrainModel {
             "seed": args.seed,
             "device": args.device,
             "lora_rank": args.lora_rank,
+            "parallel_strategy": args.parallel_strategy,
         });
         let config_path = ctx.stage_dir.join("train_config.json");
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap())
@@ -221,6 +228,37 @@ mod tests {
     fn args_schema_is_valid() {
         let schema = schemars::schema_for!(Args);
         assert!(schema.schema.object.is_some());
+    }
+
+    #[test]
+    fn parallel_strategy_defaults_to_ddp() {
+        // Omitted in JSON → "ddp" (back-compat: existing specs are unchanged).
+        let json = serde_json::json!({
+            "model": {"kind": "model", "name": "from_pretrained", "config": {}},
+            "optimizer": {"kind": "optimizer", "name": "adamw", "config": {}},
+            "scheduler": {"kind": "scheduler", "name": "constant", "config": {}},
+            "loss": {"kind": "loss", "name": "cross_entropy", "config": {}},
+            "epochs": 1,
+        });
+        let args: Args = serde_json::from_value(json).unwrap();
+        assert_eq!(args.parallel_strategy, "ddp");
+        assert_eq!(args.nproc_per_node, 1);
+    }
+
+    #[test]
+    fn parallel_strategy_fsdp_roundtrips() {
+        let json = serde_json::json!({
+            "model": {"kind": "model", "name": "from_pretrained", "config": {}},
+            "optimizer": {"kind": "optimizer", "name": "adamw", "config": {}},
+            "scheduler": {"kind": "scheduler", "name": "constant", "config": {}},
+            "loss": {"kind": "loss", "name": "cross_entropy", "config": {}},
+            "epochs": 1,
+            "nproc_per_node": 2,
+            "parallel_strategy": "fsdp",
+        });
+        let args: Args = serde_json::from_value(json).unwrap();
+        assert_eq!(args.parallel_strategy, "fsdp");
+        assert_eq!(args.nproc_per_node, 2);
     }
 
     #[test]
