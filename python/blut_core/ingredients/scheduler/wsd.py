@@ -69,6 +69,19 @@ class WSDScheduler:
             (pg['lr'] / peak_lr) if peak_lr else 1.0
             for pg in optimizer.param_groups
         ]
+        # Sanity-check the implicit contract this inference depends on: no
+        # group should start ABOVE peak_lr unless a caller deliberately
+        # wants a super-peak group. In practice this catches the far more
+        # likely mistake -- passing a peak_lr that doesn't match how the
+        # optimizer was actually constructed -- which would otherwise run
+        # the entire schedule at a silently wrong rate with no signal.
+        if peak_lr and any(s > 1.0 + 1e-6 for s in self._group_scale):
+            print(
+                f"[WSD] warning: a param group's initial lr exceeds "
+                f"peak_lr={peak_lr:.2e} (scales={[round(s, 3) for s in self._group_scale]}) "
+                f"-- if this wasn't a deliberate super-peak group, peak_lr likely "
+                f"doesn't match how the optimizer was constructed"
+            )
         self.epoch = 0
         self._decay_triggered = False
         self._decay_trigger_epoch = None
