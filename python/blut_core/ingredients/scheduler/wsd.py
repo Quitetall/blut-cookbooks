@@ -56,6 +56,19 @@ class WSDScheduler:
 
         self.stable_start = self.warmup_epochs
         self._last_lr = [peak_lr] * len(optimizer.param_groups)
+        # Preserve each param group's relative LR at construction time (e.g.
+        # an encoder group scaled to a fraction of peak_lr via
+        # encoder_lr_scale before this scheduler is built) — step() applies
+        # the schedule's absolute lr scaled by this per-group ratio instead
+        # of overwriting every group with the identical value, which used to
+        # silently discard any differential per-group rate from epoch 2
+        # onward. A caller that never differentiates groups gets scale=1.0
+        # everywhere (all groups start at peak_lr), so this is a no-op for
+        # every existing single-rate use.
+        self._group_scale = [
+            (pg['lr'] / peak_lr) if peak_lr else 1.0
+            for pg in optimizer.param_groups
+        ]
         self.epoch = 0
         self._decay_triggered = False
         self._decay_trigger_epoch = None
@@ -102,9 +115,9 @@ class WSDScheduler:
             lr = self.min_lr + 0.5 * (self.peak_lr - self.min_lr) * (1 + math.cos(math.pi * progress))
 
         self._last_lr = []
-        for pg in self.optimizer.param_groups:
-            pg['lr'] = lr
-            self._last_lr.append(lr)
+        for pg, scale in zip(self.optimizer.param_groups, self._group_scale):
+            pg['lr'] = lr * scale
+            self._last_lr.append(pg['lr'])
 
     def get_last_lr(self):
         return self._last_lr
