@@ -1,0 +1,39 @@
+# blut-cookbook-core — the core BLUT cookbook (generic ML primitives)
+#
+# Provides generic ingredients, stages, and recipes that work for any ML
+# training task out of the box. Domain cookbooks (lamquant, lamu, eagle)
+# extend it by overriding what they need and inheriting everything else.
+#
+# Package name: blut-cookbook-core (parent · child · child naming).
+[package]
+name = "blut-cookbook-core"
+version = "0.1.0"
+edition = "2024"
+authors = ["Brian Lam"]
+license = "AGPL-3.0-or-later"
+description = "Core BLUT cookbook — generic ML training primitives (data/optimizer/scheduler/loss/checkpoint)."
+rust-version = "1.85"
+repository = "https://github.com/Quitetall/blut-backends"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "blut-core"
+path = "src/main.rs"
+
+[dependencies]
+blut = { git = "https://github.com/Quitetall/blut.git", rev = "e1bb077bcc50b7c06fc8660d089f76c8baa7d47e" }
+blut-backends = { package = "blut-cookbook-standard", path = "../.." }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+thiserror = "1"
+tracing = "0.1"
+async-trait = "0.1"
+which = "6"
+
+[dev-dependencies]
+tempfile = "3"

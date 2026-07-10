@@ -278,6 +278,7 @@ mod tests {
 
     #[test]
     fn venv_root_honors_env_override() {
+        let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock poisoned");
         // SAFETY: tests are serialized via TEST_ENV_LOCK at the
         // crate root for env-mutating tests. This single-shot test
         // grabs + releases without checking other state.
@@ -295,13 +296,17 @@ mod tests {
 
     #[test]
     fn default_path_is_under_data_local_dir() {
+        let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock poisoned");
         // Make sure we're not pointing at /tmp by default.
-        let _prev = std::env::var("BLUT_HF_VENV").ok();
+        let prev = std::env::var("BLUT_HF_VENV").ok();
         unsafe {
             std::env::remove_var("BLUT_HF_VENV");
         }
         let root = venv_root();
         assert!(root.ends_with("blut/hf-venv") || root.ends_with("blut\\hf-venv"));
+        if let Some(value) = prev {
+            unsafe { std::env::set_var("BLUT_HF_VENV", value) };
+        }
     }
 
     #[test]

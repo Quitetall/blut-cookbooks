@@ -88,11 +88,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn passthrough_returns_input_unchanged() {
         // Point datasets_db at a tempdir so the test doesn't touch
         // the user's real registry. Smoke test for passthrough +
         // side-effect; full registry semantics are tested in
         // datasets_db's own module.
+        let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock poisoned");
+        let previous_registry = std::env::var("LAMU_REGISTRY_DIR").ok();
         let td = tempfile::tempdir().unwrap();
         unsafe {
             std::env::set_var("LAMU_REGISTRY_DIR", td.path());
@@ -119,6 +122,10 @@ mod tests {
             assert_eq!(out.path, input.path);
             assert_eq!(out.content_hash, input.content_hash);
             assert_eq!(out.n_examples, input.n_examples);
+        }
+        match previous_registry {
+            Some(value) => unsafe { std::env::set_var("LAMU_REGISTRY_DIR", value) },
+            None => unsafe { std::env::remove_var("LAMU_REGISTRY_DIR") },
         }
     }
 }

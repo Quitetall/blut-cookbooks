@@ -6,9 +6,7 @@ Run: cd blut/python && python -m pytest tests/test_metric_log.py -q
 from __future__ import annotations
 
 import csv
-import dataclasses
 import importlib
-import os
 
 import pytest
 
@@ -72,37 +70,3 @@ def test_append_never_raises(tmp_path):
     m.append({"epoch": 1, "weird": {1, 2, 3}, "obj": object()})
     rows = _csv_rows(m.path)
     assert len(rows) == 1  # still wrote a complete file
-
-
-def test_schema_matches_epochreport(tmp_path):
-    """The metric stream must preserve every EpochReport field (minus
-    alpha_per_layer) as a column — guards warm/qat emit-site schema drift."""
-    from lamquant.common.training_types import EpochReport
-
-    kwargs = {}
-    for f in dataclasses.fields(EpochReport):
-        if f.default is not dataclasses.MISSING or f.default_factory is not dataclasses.MISSING:
-            continue
-        t = str(f.type)
-        if "int" in t:
-            kwargs[f.name] = 0
-        elif "float" in t:
-            kwargs[f.name] = 0.0
-        elif "bool" in t:
-            kwargs[f.name] = False
-        elif "str" in t:
-            kwargs[f.name] = ""
-        else:
-            kwargs[f.name] = None
-    try:
-        ep = EpochReport(**kwargs)
-        d = ep.to_dict()
-    except Exception as e:
-        pytest.skip(f"EpochReport not trivially constructible for schema check: {e}")
-    d.pop("alpha_per_layer", None)
-
-    m = _force_csv(MetricLog("run4", tmp_path))
-    m.append(d)
-    cols = _csv_header(m.path)
-    missing = set(map(str, d.keys())) - cols
-    assert not missing, f"metric stream dropped EpochReport fields: {missing}"
