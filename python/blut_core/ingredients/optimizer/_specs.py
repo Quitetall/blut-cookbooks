@@ -8,13 +8,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import torch
-
 from blut_core.registry import register_ingredient
 from blut_core.spec import IngredientSpec
 
 
 # ---- AdamW --------------------------------------------------------------
+def _torch_optimizer(name):
+    import torch
+
+    return getattr(torch.optim, name)
+
+
 @dataclass(frozen=True)
 class AdamwConfig:
     lr: float = 1e-3
@@ -29,7 +33,7 @@ def _adamw():
         name="adamw", kind="optimizer", config_cls=AdamwConfig,
         build_param_groups=lambda named, cfg: [
             {"params": [q for _n, q in named if q.requires_grad]}],
-        construct=lambda groups, cfg: torch.optim.AdamW(
+        construct=lambda groups, cfg: _torch_optimizer("AdamW")(
             groups, lr=cfg.lr, weight_decay=cfg.weight_decay, betas=cfg.betas,
             fused=cfg.fused),
     )
@@ -50,7 +54,7 @@ def _sgd():
         name="sgd", kind="optimizer", config_cls=SgdConfig,
         build_param_groups=lambda named, cfg: [
             {"params": [q for _n, q in named if q.requires_grad]}],
-        construct=lambda groups, cfg: torch.optim.SGD(
+        construct=lambda groups, cfg: _torch_optimizer("SGD")(
             groups, lr=cfg.lr, momentum=cfg.momentum,
             weight_decay=cfg.weight_decay, nesterov=cfg.nesterov),
     )
@@ -99,19 +103,24 @@ def _soap_groups(named, cfg):
     return [{"params": [q for _n, q in named if q.requires_grad]}]
 
 
+def _construct_soap(groups, cfg):
+    from blut_core.ingredients.optimizer.soap_optimizer import SOAP
+
+    return SOAP(
+        groups, lr=cfg.lr, betas=cfg.betas, shampoo_beta=cfg.shampoo_beta,
+        eps=cfg.eps, weight_decay=cfg.weight_decay,
+        precondition_frequency=cfg.precondition_frequency,
+        max_precond_dim=cfg.max_precond_dim, merge_dims=cfg.merge_dims,
+        precondition_1d=cfg.precondition_1d, correct_bias=cfg.correct_bias,
+        cautious_wd=cfg.cautious_wd)
+
+
 @register_ingredient
 def _soap():
-    from blut_core.ingredients.optimizer.soap_optimizer import SOAP
     return IngredientSpec(
         name="soap", kind="optimizer", config_cls=SoapConfig,
         build_param_groups=_soap_groups,
-        construct=lambda groups, cfg: SOAP(
-            groups, lr=cfg.lr, betas=cfg.betas, shampoo_beta=cfg.shampoo_beta,
-            eps=cfg.eps, weight_decay=cfg.weight_decay,
-            precondition_frequency=cfg.precondition_frequency,
-            max_precond_dim=cfg.max_precond_dim, merge_dims=cfg.merge_dims,
-            precondition_1d=cfg.precondition_1d, correct_bias=cfg.correct_bias,
-            cautious_wd=cfg.cautious_wd),
+        construct=_construct_soap,
     )
 
 
@@ -140,11 +149,16 @@ def _muon_groups(named, cfg):
     ]
 
 
+def _construct_muon(groups, _cfg):
+    from blut_core.ingredients.optimizer.muon_optimizer import Muon
+
+    return Muon(groups)
+
+
 @register_ingredient
 def _muon():
-    from blut_core.ingredients.optimizer.muon_optimizer import Muon
     return IngredientSpec(
         name="muon", kind="optimizer", config_cls=MuonConfig,
         build_param_groups=_muon_groups,
-        construct=lambda groups, cfg: Muon(groups),
+        construct=_construct_muon,
     )
