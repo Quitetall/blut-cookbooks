@@ -11,4 +11,9 @@ builds without sibling checkouts.
 
 ```sh
 cargo test --workspace --all-targets --locked
+PYTHONPATH=python python -m pytest -q python
 ```
+
+`python/blut_core` is the single Python runtime package for both crates. Runtime
+launchers must install it or prepend this repository's `python` directory to
+`PYTHONPATH`.

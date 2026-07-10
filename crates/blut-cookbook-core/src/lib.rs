@@ -4,8 +4,8 @@
 //! training task out of the box. Domain cookbooks (lamquant, lamu, eagle)
 //! extend it by overriding what they need and inheriting everything else.
 //!
-//! The ingredient system (`blut_core` Python package) lives in
-//! `python/blut_core/` and provides 24 generic ingredient specs across
+//! The ingredient system (`blut_core` Python package) lives at the owner
+//! workspace's `python/blut_core/` and provides 24 generic ingredient specs across
 //! 12 kinds (data, model, optimizer, scheduler, loss, step, ema,
 //! checkpoint, eval, sampler, logging, forward).
 

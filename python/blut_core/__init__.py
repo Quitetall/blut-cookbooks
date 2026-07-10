@@ -1,7 +1,6 @@
-"""blut_core — domain-agnostic primitives for the BLUT core cookbook.
+"""Shared Python runtime and ingredient registry for BLUT cookbooks.
 
-Implement-once building blocks every training run needs, reusable by ANY
-cookbook (lamquant, lamu) — no LamQuant/EEG coupling:
+The package contains domain-agnostic building blocks reusable by any cookbook:
 
 - ``runctx``       — run identity + filesystem anchors from the BLUT env (P10)
 - ``MetricLog``    — atomic per-epoch CSV/Parquet metric writer
@@ -10,12 +9,25 @@ cookbook (lamquant, lamu) — no LamQuant/EEG coupling:
 - ``RunManifest``  — run provenance, written even on crash (P8)
 - ``checkpoint``   — corruption-safe save/load + resume payload contract (P7)
 - ``sysgauge``     — best-effort GPU/host snapshot for the metric stream (P10)
+- ingredient specs and builders used by generic training recipes
 
 ``torch`` is lazy-imported only inside ``checkpoint``/``sysgauge`` functions, so
 ``import blut_core`` stays cheap and dependency-light. See ``blut/docs/metrics.md``
 and decisions/0037, 0044.
 """
-from . import runctx, status, sysgauge, checkpoint
+
+from blut_core.registry import (
+    build_ingredient,
+    get_spec,
+    list_ingredients,
+    register_ingredient,
+)
+from blut_core.spec import KINDS, IngredientSpec
+
+# Register generic ingredient specs on package import.
+from blut_core.ingredients import _specs as _ingredient_specs  # noqa: F401
+
+from . import checkpoint, runctx, status, sysgauge
 from .metric_log import MetricLog
 from .run_manifest import RunManifest
 
@@ -24,6 +36,17 @@ from .run_manifest import RunManifest
 # `from blut_core import read_metric` still works (submodule import).
 
 __all__ = [
-    "runctx", "status", "sysgauge", "checkpoint", "read_metric",
-    "MetricLog", "RunManifest",
+    "IngredientSpec",
+    "KINDS",
+    "MetricLog",
+    "RunManifest",
+    "build_ingredient",
+    "checkpoint",
+    "get_spec",
+    "list_ingredients",
+    "read_metric",
+    "register_ingredient",
+    "runctx",
+    "status",
+    "sysgauge",
 ]
