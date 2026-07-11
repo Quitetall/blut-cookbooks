@@ -4,10 +4,9 @@ Targets the pure-logic surface: ULID, config hashing, checkpoint
 hashing, manifest dataclass round-trips, atomic write, context-manager
 protocol (clean exit + exception path).
 
-Excluded:
-  - `_library_versions` / `_hardware_info` — environment-dependent;
-    smoke-tested only.
-  - `_git_sha` — depends on git state; smoke-tested only.
+Environment-dependent helpers receive smoke coverage only:
+  - `_library_versions` / `_hardware_info`
+  - `_git_sha`, which depends on git state
 """
 from __future__ import annotations
 
@@ -17,7 +16,6 @@ from pathlib import Path
 
 import pytest
 
-from blut_core import run_manifest
 from blut_core.run_manifest import (
     RunManifest,
     _checkpoint_sha,
@@ -44,7 +42,7 @@ class TestUlid:
 
     def test_unique_across_calls(self) -> None:
         ids = {_ulid() for _ in range(100)}
-        assert len(ids) == 100, "ULID collisions in 100 draws — uuid4 broken"
+        assert len(ids) == 100, "run ID collision in 100 draws"
 
 
 class TestConfigSha:
@@ -252,4 +250,3 @@ class TestAtomicWrite:
         data = json.loads((m.out_dir / "RUN_MANIFEST.json").read_text())
         assert data["out_dir"] == str(m.out_dir)
         assert isinstance(data["out_dir"], str)
-
