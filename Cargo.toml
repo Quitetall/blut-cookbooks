@@ -34,7 +34,7 @@ path = "src/main.rs"
 # Production builds resolve the exact reviewed BLUT owner commit. LamQuant's
 # editable bootstrap may override this source locally, but published manifests
 # never depend on a sibling checkout.
-blut = { git = "https://github.com/Quitetall/blut.git", rev = "61e16197f55b54b23487610da62e7365a42b9e7c" }
+blut = { git = "https://github.com/Quitetall/blut.git", rev = "8fe57661259d2ab4dabf4e43d326b17b5921a0a2" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
