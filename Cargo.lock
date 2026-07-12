@@ -183,7 +183,7 @@ dependencies = [
 [[package]]
 name = "blut"
 version = "1.0.0"
-source = "git+https://github.com/Quitetall/blut.git?rev=e1bb077bcc50b7c06fc8660d089f76c8baa7d47e#e1bb077bcc50b7c06fc8660d089f76c8baa7d47e"
+source = "git+https://github.com/Quitetall/blut.git?rev=5ce326551273c4c087b44494cc3b0d37548a4080#5ce326551273c4c087b44494cc3b0d37548a4080"
 dependencies = [
  "anyhow",
  "async-trait",
