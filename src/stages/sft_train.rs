@@ -10,8 +10,6 @@
 //! Resource::Gpu enforcement); this stage only concerns itself
 //! with running the trainer once it has the GPU.
 
-use std::path::PathBuf;
-
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -170,6 +168,3 @@ impl Stage for SftTrain {
         })
     }
 }
-
-#[allow(dead_code)]
-fn _path_marker(_p: &PathBuf) {}

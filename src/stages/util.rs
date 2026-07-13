@@ -72,6 +72,8 @@ pub(crate) fn resolve_trainer_script(
     let snippet = format!(
         "import importlib.util; s=importlib.util.find_spec({module:?}); print(s.origin if s and s.origin else '')"
     );
+    // Spawn errors fall through deliberately: legacy resolution below returns
+    // the existing actionable interpreter/script error contract.
     if let Ok(output) = std::process::Command::new(python)
         .args(["-c", &snippet])
         .output()

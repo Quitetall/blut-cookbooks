@@ -8,6 +8,8 @@ Versioning; preview versions may change APIs between prereleases.
 - Establish `blut-cookbook-standard` and `blut-cookbook-core` as one versioned
   release train on BLUT `0.2.0-alpha.1`.
 - Add installable Python 3.12 distribution for `blut_core`.
+- Declare version-bounded Unsloth training dependencies through the `training`
+  extra while keeping base imports lightweight.
 - Package runnable standard trainer modules and embed the HF trainer wrapper so
   installed crates do not depend on a source checkout.
 - Propagate `blut-core` CLI failures through process exit status.
