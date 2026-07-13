@@ -8,14 +8,13 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use blut::artifacts::{DatasetJsonl, HfCheckpoint};
 use crate::backend::TrainBackend;
+use crate::backends::lamu::python_backend::PythonTrainBackend;
+use blut::artifacts::{DatasetJsonl, HfCheckpoint};
 use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
-use blut::paths;
-use crate::backends::lamu::python_backend::PythonTrainBackend;
 use blut::spec::{DatasetSource, Method, Optim, TrainSpec};
 
 pub struct DistillTrain;
@@ -102,9 +101,8 @@ impl Stage for DistillTrain {
             .map_err(|e| StageError::BadInput(format!("{e}")))?;
 
         let python =
-            paths::resolve_python().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-        let trainer_script = paths::resolve_trainer_script_named("trainer_distill.py")
-            .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
+            blut::paths::resolve_python().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
+        let trainer_script = super::util::resolve_trainer_script(&python, "trainer_distill.py")?;
         let mut backend = PythonTrainBackend::new(python, trainer_script)
             .with_env(
                 "LAMU_TEACHER_PATH",

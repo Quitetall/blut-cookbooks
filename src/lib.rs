@@ -12,9 +12,9 @@
 //!
 //! Public surface:
 //!
-//!   - `stages::*` — concrete generic-LLM ingredient impls (materialize,
-//!     filter, split, sft/dpo/distill train, merge_lora, convert_gguf,
-//!     register_model, eval_*).
+//!   - `stages::*` — concrete generic-LLM ingredient implementations.
+//!     Experimental stages remain importable for compatibility but are not
+//!     registered until they produce real artifacts and metrics.
 //!   - `backends::*` — the concrete training-backend identities
 //!     (`HfTrainerBackend`, `LamuTrainerBackend`) + their subprocess
 //!     runners / venv management / backend-specific ingredients. Re-exports
@@ -51,8 +51,8 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 // Convenience re-exports mirroring the engine's old top-level surface,
 // so callers that named these directly keep a single import path.
 pub use backend::{StatusFn, TrainArtifact, TrainBackend};
-pub use backends::{HfTrainerBackend, LamuTrainerBackend, TrainingBackend};
 pub use backends::lamu::python_backend::PythonTrainBackend;
+pub use backends::{HfTrainerBackend, LamuTrainerBackend, TrainingBackend};
 
 // The job/status persistence schema (TrainSpec / StatusUpdate) + the
 // TrainError type stay in the engine (the framework's `jobs.rs` reads
@@ -74,26 +74,40 @@ pub struct StandardCookbook;
 /// Erased ingredient constructors for declarative `.toml` recipe support.
 /// Each entry maps a name → `Arc<dyn StageDyn>` constructor.
 static STANDARD_STAGES_ERASED: &[(&str, blut::framework::stage::ErasedStageCtor)] = &[
-    ("materialize_conversations", || std::sync::Arc::new(stages::MaterializeConversations)),
-    ("materialize_dataset_path", || std::sync::Arc::new(stages::MaterializeDatasetPath)),
-    ("materialize_for_eval", || std::sync::Arc::new(stages::MaterializeForEval)),
-    ("filter_dataset", || std::sync::Arc::new(stages::FilterDataset)),
-    ("split_train_eval", || std::sync::Arc::new(stages::SplitTrainEval)),
-    ("register_dataset", || std::sync::Arc::new(stages::RegisterDataset)),
+    ("materialize_conversations", || {
+        std::sync::Arc::new(stages::MaterializeConversations)
+    }),
+    ("materialize_dataset_path", || {
+        std::sync::Arc::new(stages::MaterializeDatasetPath)
+    }),
+    ("materialize_for_eval", || {
+        std::sync::Arc::new(stages::MaterializeForEval)
+    }),
+    ("filter_dataset", || {
+        std::sync::Arc::new(stages::FilterDataset)
+    }),
+    ("split_train_eval", || {
+        std::sync::Arc::new(stages::SplitTrainEval)
+    }),
+    ("register_dataset", || {
+        std::sync::Arc::new(stages::RegisterDataset)
+    }),
     ("take_train", || std::sync::Arc::new(stages::TakeTrain)),
     ("sft_train", || std::sync::Arc::new(stages::SftTrain)),
-    ("dpo_train", || std::sync::Arc::new(stages::DpoTrain)),
-    ("distill_train", || std::sync::Arc::new(stages::DistillTrain)),
-    ("merge_lora", || std::sync::Arc::new(stages::MergeLora)),
     ("convert_gguf", || std::sync::Arc::new(stages::ConvertGguf)),
-    ("register_model", || std::sync::Arc::new(stages::RegisterModel)),
-    ("eval_loss", || std::sync::Arc::new(stages::EvalLoss)),
-    ("eval_lm_harness", || std::sync::Arc::new(stages::EvalLmHarness)),
-    ("eval_judge", || std::sync::Arc::new(stages::EvalJudge)),
-    ("merge_reports", || std::sync::Arc::new(stages::MergeReports)),
+    ("register_model", || {
+        std::sync::Arc::new(stages::RegisterModel)
+    }),
+    ("merge_reports", || {
+        std::sync::Arc::new(stages::MergeReports)
+    }),
     // HF-backend-specific ingredients
-    ("hf_sft_train", || std::sync::Arc::new(backends::hf_trainer::stages::HfSftTrain)),
-    ("hf_dpo_train", || std::sync::Arc::new(backends::hf_trainer::stages::HfDpoTrain)),
+    ("hf_sft_train", || {
+        std::sync::Arc::new(backends::hf_trainer::stages::HfSftTrain)
+    }),
+    ("hf_dpo_train", || {
+        std::sync::Arc::new(backends::hf_trainer::stages::HfDpoTrain)
+    }),
 ];
 
 impl Cookbook for StandardCookbook {
@@ -116,4 +130,31 @@ pub fn registry() -> Registry {
     let mut r = Registry::new();
     r.register(Box::new(StandardCookbook));
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_registry_excludes_nonfunctional_or_synthetic_stages() {
+        let names: Vec<_> = StandardCookbook
+            .stages_erased()
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        for hidden in [
+            "dpo_train",
+            "distill_train",
+            "merge_lora",
+            "eval_loss",
+            "eval_lm_harness",
+            "eval_judge",
+        ] {
+            assert!(
+                !names.contains(&hidden),
+                "{hidden} must remain experimental"
+            );
+        }
+    }
 }

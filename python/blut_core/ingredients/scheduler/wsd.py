@@ -55,6 +55,8 @@ class WSDScheduler:
             self._infinite = False
 
         self.stable_start = self.warmup_epochs
+        self._configured_decay_epochs = self.decay_epochs
+        self._configured_decay_start = self.decay_start
         self._last_lr = [peak_lr] * len(optimizer.param_groups)
         # Preserve each param group's relative LR at construction time (e.g.
         # an encoder group scaled to a fraction of peak_lr via
@@ -133,7 +135,100 @@ class WSDScheduler:
             self._last_lr.append(pg['lr'])
 
     def get_last_lr(self):
-        return self._last_lr
+        return list(self._last_lr)
+
+    def state_dict(self) -> dict:
+        """Return all mutable scheduler state needed for exact resume.
+
+        Configuration values ride with the state so loading into an
+        incompatible scheduler fails instead of silently changing the LR
+        trajectory. The optimizer itself remains responsible for its own state.
+        """
+        return {
+            "version": 1,
+            "epoch": self.epoch,
+            "last_lr": list(self._last_lr),
+            "group_scale": list(self._group_scale),
+            "decay_triggered": self._decay_triggered,
+            "decay_trigger_epoch": self._decay_trigger_epoch,
+            "decay_epochs": self.decay_epochs,
+            "decay_start": self.decay_start,
+            "infinite": self._infinite,
+            "config": {
+                "total_epochs": self.total_epochs,
+                "peak_lr": self.peak_lr,
+                "min_lr": self.min_lr,
+                "warmup_epochs": self.warmup_epochs,
+                "warmup_kind": self.warmup_kind,
+                "configured_decay_epochs": self._configured_decay_epochs,
+                "configured_decay_start": self._configured_decay_start,
+            },
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore scheduler progress and optimizer group learning rates.
+
+        Raises ``ValueError`` for malformed or incompatible state. Resume must
+        never fall back to a fresh warmup schedule without an explicit caller
+        decision.
+        """
+        if not isinstance(state, dict):
+            raise ValueError("WSD scheduler state must be a mapping")
+        if state.get("version") != 1:
+            raise ValueError(
+                f"unsupported WSD scheduler state version: {state.get('version')!r}"
+            )
+
+        expected_config = self.state_dict()["config"]
+        if state.get("config") != expected_config:
+            raise ValueError(
+                "WSD scheduler state is incompatible with current configuration"
+            )
+
+        last_lr = state.get("last_lr")
+        group_scale = state.get("group_scale")
+        n_groups = len(self.optimizer.param_groups)
+        if not isinstance(last_lr, list) or len(last_lr) != n_groups:
+            raise ValueError(
+                f"WSD scheduler state has {len(last_lr) if isinstance(last_lr, list) else 'invalid'} "
+                f"learning rates for {n_groups} optimizer groups"
+            )
+        if group_scale != self._group_scale:
+            raise ValueError("WSD scheduler optimizer group scales do not match")
+
+        epoch = state.get("epoch")
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+            raise ValueError(f"invalid WSD scheduler epoch: {epoch!r}")
+        decay_epochs = state.get("decay_epochs")
+        decay_start = state.get("decay_start")
+        if not isinstance(decay_epochs, int) or decay_epochs < 0:
+            raise ValueError(f"invalid WSD decay_epochs: {decay_epochs!r}")
+        if not isinstance(decay_start, int):
+            raise ValueError(f"invalid WSD decay_start: {decay_start!r}")
+        if state.get("infinite") is not self._infinite:
+            raise ValueError("WSD scheduler infinite-mode setting does not match")
+        if not all(isinstance(lr, (int, float)) and math.isfinite(lr) for lr in last_lr):
+            raise ValueError("WSD scheduler state contains a non-finite learning rate")
+        decay_triggered = state.get("decay_triggered")
+        decay_trigger_epoch = state.get("decay_trigger_epoch")
+        if not isinstance(decay_triggered, bool):
+            raise ValueError("WSD decay_triggered must be boolean")
+        if decay_triggered:
+            if not isinstance(decay_trigger_epoch, int) or decay_trigger_epoch < 0:
+                raise ValueError(
+                    f"invalid WSD decay_trigger_epoch: {decay_trigger_epoch!r}"
+                )
+        elif decay_trigger_epoch is not None:
+            raise ValueError("WSD decay_trigger_epoch set before decay was triggered")
+
+        self.epoch = epoch
+        self._last_lr = list(last_lr)
+        self._decay_triggered = decay_triggered
+        self._decay_trigger_epoch = decay_trigger_epoch
+        self.decay_epochs = decay_epochs
+        self.decay_start = decay_start
+        for group, lr in zip(self.optimizer.param_groups, self._last_lr):
+            group["lr"] = lr
 
     @property
     def phase(self) -> str:

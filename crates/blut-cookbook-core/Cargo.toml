@@ -7,13 +7,19 @@
 # Package name: blut-cookbook-core (parent · child · child naming).
 [package]
 name = "blut-cookbook-core"
-version = "0.1.0"
+version = "0.2.0-alpha.1"
 edition = "2024"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "Core BLUT cookbook — generic ML training primitives (data/optimizer/scheduler/loss/checkpoint)."
-rust-version = "1.85"
+rust-version = "1.88"
 repository = "https://github.com/Quitetall/blut-backends"
+homepage = "https://github.com/Quitetall/blut-backends"
+documentation = "https://docs.rs/blut-cookbook-core"
+readme = "README.md"
+keywords = ["machine-learning", "training", "workflow"]
+categories = ["science", "development-tools"]
+include = ["/src/**", "/tests/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [lib]
 path = "src/lib.rs"
@@ -23,8 +29,8 @@ name = "blut-core"
 path = "src/main.rs"
 
 [dependencies]
-blut = { git = "https://github.com/Quitetall/blut.git", rev = "e1bb077bcc50b7c06fc8660d089f76c8baa7d47e" }
-blut-backends = { package = "blut-cookbook-standard", path = "../.." }
+blut = "=0.2.0-alpha.1"
+blut-backends = { package = "blut-cookbook-standard", path = "../..", version = "=0.2.0-alpha.1" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

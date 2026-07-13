@@ -10,8 +10,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use blut::artifacts::DatasetJsonl;
 use crate::conversations;
+use blut::artifacts::DatasetJsonl;
 use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;

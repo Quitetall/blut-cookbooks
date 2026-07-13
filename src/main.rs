@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Binary entry point for the standard ML cookbook.
 // Usage: blut-standard recipe list / blut-standard tui / etc.
 #[tokio::main]

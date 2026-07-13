@@ -19,14 +19,8 @@ pub fn make_stage(name: &str) -> Option<Box<dyn StageDyn>> {
         "register_dataset" => Box::new(RegisterDataset),
         "take_train" => Box::new(TakeTrain),
         "sft_train" => Box::new(SftTrain),
-        "dpo_train" => Box::new(DpoTrain),
-        "distill_train" => Box::new(DistillTrain),
-        "merge_lora" => Box::new(MergeLora),
         "convert_gguf" => Box::new(ConvertGguf),
         "register_model" => Box::new(RegisterModel),
-        "eval_loss" => Box::new(EvalLoss),
-        "eval_lm_harness" => Box::new(EvalLmHarness),
-        "eval_judge" => Box::new(EvalJudge),
         "merge_reports" => Box::new(MergeReports),
         _ => return None,
     })
@@ -43,14 +37,8 @@ pub fn names() -> &'static [&'static str] {
         "register_dataset",
         "take_train",
         "sft_train",
-        "dpo_train",
-        "distill_train",
-        "merge_lora",
         "convert_gguf",
         "register_model",
-        "eval_loss",
-        "eval_lm_harness",
-        "eval_judge",
         "merge_reports",
     ]
 }
@@ -70,5 +58,20 @@ mod tests {
     #[test]
     fn unknown_name_returns_none() {
         assert!(make_stage("definitely-not-a-stage").is_none());
+    }
+
+    #[test]
+    fn experimental_stages_are_not_in_public_catalog() {
+        for name in [
+            "dpo_train",
+            "distill_train",
+            "merge_lora",
+            "eval_loss",
+            "eval_lm_harness",
+            "eval_judge",
+        ] {
+            assert!(make_stage(name).is_none(), "{name} must remain hidden");
+            assert!(!names().contains(&name));
+        }
     }
 }

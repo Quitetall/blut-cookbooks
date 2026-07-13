@@ -6,10 +6,9 @@
 //! venv at `~/.local/share/blut/hf-venv/` — auto-provisioned on
 //! first use so users don't fight Python environment drift.
 //!
-//! Land status (BB-1): stub. Real runner + stages + recipes land
-//! in BB-4 + BB-5. This module exists now so the typed `Plan`
-//! machinery can name `HfTrainerBackend` at compile time
-//! everywhere it needs to without forward-declaring.
+//! The runner and SFT/DPO stages execute real Transformers/TRL training. Its
+//! Python wrapper is embedded in the Rust crate and materialized privately at
+//! launch, so installed packages do not depend on a retained source checkout.
 
 pub mod runner;
 pub mod stages;

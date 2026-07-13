@@ -25,9 +25,80 @@ pub(crate) fn write_report(
     })
 }
 
+/// Resolve a trainer owned by this cookbook.
+///
+/// Public installs use the `blut_standard` Python package. Source checkouts
+/// use the in-tree module. Legacy engine resolution remains last for existing
+/// deployments and explicit overrides.
+pub(crate) fn resolve_trainer_script(
+    python: &std::path::Path,
+    filename: &str,
+) -> Result<std::path::PathBuf, blut::framework::error::StageError> {
+    use blut::framework::error::StageError;
+
+    let (module, override_name) = match filename {
+        "trainer.py" => ("blut_standard.trainer", "BLUT_STANDARD_TRAINER_PY"),
+        "trainer_dpo.py" => ("blut_standard.trainer_dpo", "BLUT_STANDARD_TRAINER_DPO_PY"),
+        "trainer_distill.py" => (
+            "blut_standard.trainer_distill",
+            "BLUT_STANDARD_TRAINER_DISTILL_PY",
+        ),
+        other => {
+            return Err(StageError::BadInput(format!(
+                "unsupported standard trainer script: {other}"
+            )));
+        }
+    };
+
+    if let Ok(path) = std::env::var(override_name) {
+        let path = std::path::PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(StageError::BadInput(format!(
+            "${override_name} does not name a file: {}",
+            path.display()
+        )));
+    }
+
+    let source_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join("blut_standard")
+        .join(filename);
+    if source_path.is_file() {
+        return Ok(source_path);
+    }
+
+    let snippet = format!(
+        "import importlib.util; s=importlib.util.find_spec({module:?}); print(s.origin if s and s.origin else '')"
+    );
+    if let Ok(output) = std::process::Command::new(python)
+        .args(["-c", &snippet])
+        .output()
+        && output.status.success()
+    {
+        let path = std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    let legacy = if filename == "trainer.py" {
+        blut::paths::resolve_trainer_script()
+    } else {
+        blut::paths::resolve_trainer_script_named(filename)
+    };
+    legacy.map_err(|error| {
+        StageError::Backend(anyhow::anyhow!(
+            "{module} not installed for {}; install blut-cookbook-standard into that interpreter or set ${override_name}: {error}",
+            python.display()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::write_report;
+    use super::{resolve_trainer_script, write_report};
 
     #[test]
     fn write_report_creates_parent_and_writes_pretty_json() {
@@ -43,5 +114,21 @@ mod tests {
         // pretty-printed → multi-line
         assert!(std::fs::read_to_string(&path).unwrap().contains('\n'));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_trainer_resolves_from_cookbook_owner() {
+        let path = resolve_trainer_script(std::path::Path::new("python3"), "trainer.py")
+            .expect("source trainer");
+        assert!(path.ends_with("python/blut_standard/trainer.py"));
+    }
+
+    #[test]
+    fn unknown_trainer_is_rejected() {
+        let result = resolve_trainer_script(std::path::Path::new("python3"), "other.py");
+        assert!(matches!(
+            result,
+            Err(blut::framework::error::StageError::BadInput(_))
+        ));
     }
 }

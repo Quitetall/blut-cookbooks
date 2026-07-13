@@ -73,12 +73,12 @@ mod tests {
     fn core_cookbook_registers_and_lists_recipes() {
         let r = registry();
         assert!(r.find("train_from_dataset").is_some());
-        assert!(r.find("finetune_pretrained").is_some());
         assert!(r.find("eval_only").is_some());
+        assert!(r.find("finetune_pretrained").is_none());
         assert_eq!(
             r.all().count(),
-            3 + blut_backends::StandardCookbook.recipes().len(),
-            "3 core recipes + standard cookbook recipes"
+            2 + blut_backends::StandardCookbook.recipes().len(),
+            "2 release-ready core recipes + standard cookbook recipes"
         );
     }
 

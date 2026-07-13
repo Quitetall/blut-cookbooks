@@ -14,10 +14,9 @@
 //!     `{"kind": "failed", "error": str}`
 //!   - Stderr: free-form. Captured to tracing::warn.
 //!
-//! The wrapper script lives at
-//! `src/backends/hf_trainer/python/hf_trainer_runner.py` and is
-//! invoked via the auto-managed venv at `~/.local/share/blut/hf-venv/`
-//! (see `super::venv`).
+//! The wrapper source is embedded at compile time, materialized beside the
+//! private job specification, and invoked through the auto-managed venv at
+//! `~/.local/share/blut/hf-venv/` (see `super::venv`).
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -32,6 +31,8 @@ use tokio::process::Command;
 use blut::python_kill::graceful_kill_pid;
 
 use super::venv::{VenvError, ensure_venv};
+
+const BUNDLED_HF_TRAINER_RUNNER: &[u8] = include_bytes!("python/hf_trainer_runner.py");
 
 /// Typed job spec the Rust side hands the Python wrapper. Mirrors
 /// `transformers.TrainingArguments` for the canonical fields +
@@ -76,7 +77,9 @@ pub struct HfTrainerJob {
     pub nproc_per_node: u32,
 }
 
-fn default_nproc() -> u32 { 1 }
+fn default_nproc() -> u32 {
+    1
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeftConfig {
@@ -157,6 +160,21 @@ pub struct HfTrainerRunner {
     child_pid: Arc<Mutex<Option<u32>>>,
 }
 
+fn write_private_job_spec(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(body)?;
+    file.sync_all()
+}
+
 impl HfTrainerRunner {
     pub fn new() -> Self {
         Self {
@@ -186,34 +204,29 @@ impl HfTrainerRunner {
         })?;
         let spec_path = td.path().join("job.json");
         let body = serde_json::to_vec_pretty(&job).map_err(RunError::SerializeJob)?;
-        std::fs::write(&spec_path, body).map_err(|source| RunError::Io {
+        write_private_job_spec(&spec_path, &body).map_err(|source| RunError::Io {
             path: spec_path.clone(),
             source,
         })?;
 
-        // Locate the wrapper script. It ships in-tree and gets
-        // resolved relative to the runner module at compile time.
-        let wrapper = match wrapper_path() {
-            Some(p) if p.exists() => p,
-            _ => {
-                return Err(RunError::Io {
-                    path: PathBuf::from("src/backends/hf_trainer/python/hf_trainer_runner.py"),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "wrapper script missing; expected alongside the binary",
-                    ),
-                });
-            }
-        };
+        // Materialize the compile-time bundled wrapper beside the private job
+        // spec. This works from crates.io/cargo-install builds without relying
+        // on a retained Cargo source checkout.
+        let wrapper = wrapper_path(td.path()).map_err(|source| RunError::Io {
+            path: td.path().join("hf_trainer_runner.py"),
+            source,
+        })?;
 
         // DDP: when nproc_per_node > 1, launch via torchrun
         let nproc = job.nproc_per_node.max(1);
         let mut cmd = Command::new(&python);
         if nproc > 1 {
             cmd.args([
-                "-m", "torch.distributed.run",
+                "-m",
+                "torch.distributed.run",
                 "--standalone",
-                "--nproc_per_node", &nproc.to_string(),
+                "--nproc_per_node",
+                &nproc.to_string(),
             ]);
         }
         cmd.arg(&wrapper).arg(&spec_path);
@@ -304,15 +317,15 @@ impl HfTrainerRunner {
             path: PathBuf::from("hf-trainer-wait"),
             source,
         })?;
-        if let Some(h) = stdout_handle {
-            if let Err(e) = h.await {
-                tracing::error!(target: "blut::hf_trainer", "stdout reader join failed: {e}");
-            }
+        if let Some(h) = stdout_handle
+            && let Err(e) = h.await
+        {
+            tracing::error!(target: "blut::hf_trainer", "stdout reader join failed: {e}");
         }
-        if let Some(h) = stderr_handle {
-            if let Err(e) = h.await {
-                tracing::error!(target: "blut::hf_trainer", "stderr reader join failed: {e}");
-            }
+        if let Some(h) = stderr_handle
+            && let Err(e) = h.await
+        {
+            tracing::error!(target: "blut::hf_trainer", "stderr reader join failed: {e}");
         }
         if let Some(pid) = self.child_pid.lock().take() {
             blut::python_kill::unregister_child(pid);
@@ -350,45 +363,24 @@ impl Default for HfTrainerRunner {
     }
 }
 
-/// Locate the wrapper script. Resolution order:
-///   1. `$BLUT_HF_TRAINER_RUNNER` env (absolute path override)
-///   2. `<exe_dir>/python/hf_trainer_runner.py` (when installed
-///      alongside the binary)
-///   3. `<repo_root>/src/backends/hf_trainer/python/hf_trainer_runner.py`
-///      (development tree)
-fn wrapper_path() -> Option<PathBuf> {
+/// Resolve an explicit wrapper override or materialize bundled source.
+fn wrapper_path(tempdir: &std::path::Path) -> std::io::Result<PathBuf> {
     if let Ok(p) = std::env::var("BLUT_HF_TRAINER_RUNNER") {
-        return Some(PathBuf::from(p));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("python").join("hf_trainer_runner.py");
-            if p.exists() {
-                return Some(p);
-            }
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Ok(path);
         }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "$BLUT_HF_TRAINER_RUNNER does not name a file: {}",
+                path.display()
+            ),
+        ));
     }
-    // Development tree fallback: walk up to find a Cargo.toml then
-    // resolve against `src/backends/hf_trainer/python/`.
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut cur = cwd.as_path();
-        loop {
-            let candidate = cur
-                .join("src")
-                .join("backends")
-                .join("hf_trainer")
-                .join("python")
-                .join("hf_trainer_runner.py");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            match cur.parent() {
-                Some(p) => cur = p,
-                None => break,
-            }
-        }
-    }
-    None
+    let path = tempdir.join("hf_trainer_runner.py");
+    write_private_job_spec(&path, BUNDLED_HF_TRAINER_RUNNER)?;
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -441,11 +433,20 @@ mod tests {
 
     #[test]
     fn wrapper_path_resolves_in_dev_tree() {
-        // In the dev tree the wrapper script doesn't exist yet
-        // (lands alongside this commit), so this test verifies the
-        // function returns Some(...) once the script is present.
-        // Until then it asserts the path-search code doesn't panic
-        // even when none exists.
-        let _ = wrapper_path();
+        let td = tempfile::tempdir().unwrap();
+        let path = wrapper_path(td.path()).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), BUNDLED_HF_TRAINER_RUNNER);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn job_spec_is_owner_read_write_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("job.json");
+        write_private_job_spec(&path, br#"{"token":"secret"}"#).unwrap();
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

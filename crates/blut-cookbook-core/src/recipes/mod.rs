@@ -6,8 +6,4 @@ pub mod train_from_dataset;
 
 use blut::recipes::recipe::RecipeDef;
 
-pub static CORE_RECIPES: &[&RecipeDef] = &[
-    &train_from_dataset::DEF,
-    &finetune_pretrained::DEF,
-    &eval_only::DEF,
-];
+pub static CORE_RECIPES: &[&RecipeDef] = &[&train_from_dataset::DEF, &eval_only::DEF];
