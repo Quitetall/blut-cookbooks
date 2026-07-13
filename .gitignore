@@ -1,4 +1,7 @@
 /target/
+/build/
+/dist/
+*.egg-info/
 /Cargo.lock.bak
 **/__pycache__/
 *.pyc

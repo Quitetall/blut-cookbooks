@@ -66,4 +66,5 @@ downstream cookbooks must require explicit user opt-in.
 
 ## License
 
-AGPL-3.0-or-later. See [LICENSE](LICENSE).
+AGPL-3.0-or-later. See [LICENSE](LICENSE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
