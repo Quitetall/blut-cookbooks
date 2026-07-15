@@ -182,12 +182,13 @@ dependencies = [
 
 [[package]]
 name = "blut"
-version = "1.0.0"
-source = "git+https://github.com/Quitetall/blut.git?rev=e1bb077bcc50b7c06fc8660d089f76c8baa7d47e#e1bb077bcc50b7c06fc8660d089f76c8baa7d47e"
+version = "0.2.0-alpha.1"
+source = "git+https://github.com/Quitetall/blut.git?rev=ceba455ec9dc34155675b325ab870dbee8928722#ceba455ec9dc34155675b325ab870dbee8928722"
 dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
+ "blut-types",
  "chrono",
  "clap",
  "crossterm 0.28.1",
@@ -258,6 +259,17 @@ dependencies = [
  "tokio",
  "tracing",
  "which",
+]
+
+[[package]]
+name = "blut-types"
+version = "0.2.0-alpha.1"
+source = "git+https://github.com/Quitetall/blut.git?rev=ceba455ec9dc34155675b325ab870dbee8928722#ceba455ec9dc34155675b325ab870dbee8928722"
+dependencies = [
+ "faster-hex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
