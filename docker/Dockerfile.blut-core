@@ -1,0 +1,107 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+FROM rust:1.88-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./
+COPY src ./src
+COPY crates ./crates
+# `blut` may be private. BuildKit exposes the optional GitHub token only to
+# this process; Git's transient environment config rewrites GitHub HTTPS URLs
+# without writing the credential into this layer or the Cargo checkout.
+# Starlark stays out of process in BLUT, so a host that accepts `.star` plans
+# also builds the evaluator from the exact engine checkout selected below.
+RUN --mount=type=secret,id=github_token \
+    set -eu; \
+    if [ -s /run/secrets/github_token ]; then \
+        github_token="$(cat /run/secrets/github_token)"; \
+        export GIT_CONFIG_COUNT=1; \
+        export GIT_CONFIG_KEY_0="url.https://x-access-token:${github_token}@github.com/.insteadOf"; \
+        export GIT_CONFIG_VALUE_0="https://github.com/"; \
+    fi; \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true cargo build \
+        --locked \
+        --release \
+        --package blut-cookbook-core \
+        --bin blut-core \
+        --features p2p,s3; \
+    engine_rev="$(awk ' \
+        $0 == "[[package]]" { in_package = 0 } \
+        $0 == "name = \"blut\"" { in_package = 1 } \
+        in_package && /^source = "git\+https:\/\/github.com\/Quitetall\/blut.git/ { \
+            sub(/^.*#/, ""); \
+            sub(/"$/, ""); \
+            print; \
+            exit \
+        } \
+    ' Cargo.lock)"; \
+    printf '%s\n' "$engine_rev" | grep --extended-regexp --quiet '^[0-9a-f]{40}$'; \
+    dsl_manifest=""; \
+    for candidate in "$CARGO_HOME"/git/checkouts/blut-*/*/crates/blut-dsl/Cargo.toml; do \
+        [ -f "$candidate" ] || continue; \
+        engine_root="${candidate%/crates/blut-dsl/Cargo.toml}"; \
+        [ "$(git -C "$engine_root" rev-parse HEAD)" = "$engine_rev" ] || continue; \
+        dsl_manifest="$candidate"; \
+        break; \
+    done; \
+    [ -n "$dsl_manifest" ]; \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true CARGO_TARGET_DIR=/tmp/blut-dsl-target cargo build \
+        --locked \
+        --release \
+        --manifest-path "$dsl_manifest" \
+        --bin blut-dsl; \
+    install --directory /out; \
+    install --mode=0755 /tmp/blut-dsl-target/release/blut-dsl /out/blut-dsl
+
+FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b AS runtime
+
+ARG DEBIAN_SNAPSHOT=20260713T000000Z
+ARG TINI_VERSION=0.19.0-1+b3
+
+LABEL org.opencontainers.image.title="BLUT core cookbook host" \
+      org.opencontainers.image.description="BLUT engine host with core and standard cookbook registries" \
+      org.opencontainers.image.source="https://github.com/Quitetall/blut-backends"
+
+RUN sed --in-place \
+       "s|http://deb.debian.org/debian-security|https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}|g; \
+        s|http://deb.debian.org/debian|https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}|g" \
+       /etc/apt/sources.list.d/debian.sources \
+    && printf 'Acquire::Check-Valid-Until "false";\n' \
+       > /etc/apt/apt.conf.d/99snapshot \
+    && apt-get update \
+    && apt-get install --yes --no-install-recommends "tini=${TINI_VERSION}" \
+    && test "$(dpkg-query --show --showformat='${Version}' tini)" = "${TINI_VERSION}" \
+    && /usr/bin/tini --version 2>&1 | grep --fixed-strings --quiet '0.19.0' \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 10001 blut \
+    && useradd --uid 10001 --gid blut --create-home --home-dir /var/lib/blut blut \
+    && install --directory --owner blut --group blut \
+       /var/cache/blut \
+       /var/lib/blut/jobs \
+       /var/lib/blut/data \
+       /var/lib/blut/hf-venv \
+       /usr/local/share/lamu/python
+
+COPY --from=builder /src/target/release/blut-core /usr/local/bin/blut-core
+COPY --from=builder /out/blut-dsl /usr/local/bin/blut-dsl
+COPY --chown=blut:blut python/ /usr/local/share/lamu/python/
+COPY --chown=blut:blut src/backends/hf_trainer/python/hf_trainer_runner.py \
+    /usr/local/share/lamu/python/hf_trainer_runner.py
+
+ENV HOME=/var/lib/blut \
+    BLUT_DSL_BIN=/usr/local/bin/blut-dsl \
+    PYTHONPATH=/usr/local/share/lamu/python \
+    LAMU_TRAINER_PY=/usr/local/share/lamu/python/trainer.py \
+    BLUT_HF_TRAINER_RUNNER=/usr/local/share/lamu/python/hf_trainer_runner.py \
+    BLUT_HF_VENV=/var/lib/blut/hf-venv \
+    LAMU_TRAIN_JOBS_DIR=/var/lib/blut/jobs \
+    LAMU_TRAIN_DATA_DIR=/var/lib/blut/data \
+    LAMU_TRAIN_CACHE_DIR=/var/cache/blut
+
+WORKDIR /var/lib/blut
+USER 10001:10001
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/blut-core"]
+CMD ["--help"]

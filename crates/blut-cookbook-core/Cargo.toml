@@ -12,7 +12,7 @@ edition = "2024"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "Core BLUT cookbook — generic ML training primitives (data/optimizer/scheduler/loss/checkpoint)."
-rust-version = "1.85"
+rust-version = "1.88"
 repository = "https://github.com/Quitetall/blut-backends"
 
 [lib]
@@ -22,8 +22,13 @@ path = "src/lib.rs"
 name = "blut-core"
 path = "src/main.rs"
 
+[features]
+default = []
+p2p = ["blut/p2p", "blut-backends/p2p"]
+s3 = ["blut/s3", "blut-backends/s3"]
+
 [dependencies]
-blut = { git = "https://github.com/Quitetall/blut.git", rev = "ebe122486cf37a06fa6e7b46db6fe0340e693857" }
+blut.workspace = true
 blut-backends = { package = "blut-cookbook-standard", path = "../.." }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"

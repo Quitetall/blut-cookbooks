@@ -3,8 +3,8 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use blut::artifacts::{GgufModel, HfCheckpoint};
 use crate::convert;
+use blut::artifacts::{GgufModel, HfCheckpoint};
 use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;

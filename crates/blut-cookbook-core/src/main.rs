@@ -2,7 +2,7 @@
 //! off to the BLUT CLI.
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let reg = blut_cookbook_core::registry();
-    let _ = blut::cli::run(reg).await;
+    blut::cli::run(reg).await
 }

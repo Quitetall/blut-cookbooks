@@ -12,27 +12,25 @@
 //! callers short-circuit. The first caller takes a sentinel lock
 //! file; concurrent callers wait via filesystem polling.
 
+use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// On-disk version stamp. Bump when the pinned dep set changes;
-/// `ensure_venv()` will rebuild rather than reuse an older stamp.
-pub const VENV_VERSION: &str = "1";
+/// Provisioning schema version. The marker also includes the requirements-lock
+/// digest, so changing the lock automatically invalidates existing venvs.
+pub const VENV_VERSION: &str = "2";
 
-/// Pinned dep specs. Bumping requires VENV_VERSION bump so stale
-/// venvs are rebuilt. The pins are conservative — known-good as
-/// of the BB-4 ship date.
-pub const REQUIRED_PKGS: &[&str] = &[
-    "transformers>=4.45,<5",
-    "datasets>=2.20,<3",
-    "accelerate>=0.34,<2",
-    "peft>=0.13,<1",
-    "bitsandbytes>=0.43,<1",
-    "trl>=0.11,<1",
-    "torch>=2.4,<3",
-    "safetensors>=0.4,<1",
-];
+/// A complete, hash-locked Linux/x86-64 resolution. The HF trainer is a GPU
+/// server backend; unsupported platforms fail closed at pip's wheel check
+/// instead of falling back to an unreviewed source build.
+const REQUIREMENTS_LOCK: &str = include_str!("requirements-hf.lock");
+const REQUIREMENTS_LOCK_FILE: &str = ".blut_hf_requirements.lock";
+const LOCKED_PYTHON_MINOR: &str = "3.12";
+const LOCKED_PLATFORM: &str = "linux-x86_64";
+
+include!(concat!(env!("OUT_DIR"), "/hf_requirements.rs"));
 
 /// Resolve the venv root. `$BLUT_HF_VENV` env wins; default
 /// `~/.local/share/blut/hf-venv/`.
@@ -58,13 +56,43 @@ fn marker_path(venv_root: &Path) -> PathBuf {
 /// Mutex file held during provisioning. Concurrent callers see
 /// this and poll the marker instead of racing pip.
 fn lock_path(venv_root: &Path) -> PathBuf {
-    venv_root.join(".blut_hf_venv_lock")
+    let name = venv_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("hf-venv");
+    venv_root.with_file_name(format!(".{name}.blut-provision.lock"))
+}
+
+fn expected_marker() -> String {
+    let digest = Sha256::digest(REQUIREMENTS_LOCK.as_bytes());
+    format!("{VENV_VERSION}:{LOCKED_PYTHON_MINOR}:{LOCKED_PLATFORM}:{digest:x}")
+}
+
+fn marker_matches(marker: &Path, py: &Path, expected: &str) -> bool {
+    marker.exists()
+        && py.exists()
+        && std::fs::read_to_string(marker)
+            .map(|contents| contents.trim() == expected)
+            .unwrap_or(false)
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum VenvError {
-    #[error("python3 not on PATH; can't bootstrap venv at {venv_root}")]
+    #[error("Python 3.12 not on PATH; install it or set BLUT_HF_PYTHON to bootstrap {venv_root}")]
     PythonMissing { venv_root: PathBuf },
+    #[error("HF trainer lock supports Python {expected}, but {executable} reports Python {actual}")]
+    UnsupportedPython {
+        executable: PathBuf,
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("HF trainer lock supports {expected}, but this binary targets {actual}")]
+    UnsupportedPlatform {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("failed to inspect Python at {executable}: {status}")]
+    PythonProbeFailed { executable: PathBuf, status: String },
     #[error("`python -m venv` failed at {venv_root}: {status}")]
     VenvCreateFailed { venv_root: PathBuf, status: String },
     #[error("pip install failed: {status}")]
@@ -89,17 +117,21 @@ pub enum VenvError {
 ///   3. Neither → take lock, run `python -m venv`, `pip install`,
 ///      write marker, release lock.
 pub fn ensure_venv() -> Result<PathBuf, VenvError> {
+    let actual_platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    if actual_platform != LOCKED_PLATFORM {
+        return Err(VenvError::UnsupportedPlatform {
+            expected: LOCKED_PLATFORM,
+            actual: actual_platform,
+        });
+    }
     let root = venv_root();
     let marker = marker_path(&root);
     let py = python_path(&root);
+    let expected = expected_marker();
 
     // Fast path: marker says we're good.
-    if marker.exists() && py.exists() {
-        if let Ok(s) = std::fs::read_to_string(&marker) {
-            if s.trim() == VENV_VERSION {
-                return Ok(py);
-            }
-        }
+    if marker_matches(&marker, &py, &expected) {
+        return Ok(py);
     }
 
     // Take the lock atomically. `create_new(true)` returns
@@ -147,13 +179,13 @@ pub fn ensure_venv() -> Result<PathBuf, VenvError> {
             let _ = std::fs::remove_file(&lock);
             return ensure_venv();
         }
-        wait_for_marker(&marker, &py, Duration::from_secs(30 * 60))?;
+        wait_for_marker(&marker, &py, &expected, Duration::from_secs(30 * 60))?;
         return Ok(py);
     }
 
     let result = (|| -> Result<(), VenvError> {
         provision(&root)?;
-        std::fs::write(&marker, VENV_VERSION).map_err(|source| VenvError::Io {
+        std::fs::write(&marker, &expected).map_err(|source| VenvError::Io {
             path: marker.clone(),
             source,
         })?;
@@ -200,15 +232,16 @@ fn pid_in_lock_is_dead(_lock: &Path) -> bool {
     false
 }
 
-fn wait_for_marker(marker: &Path, py: &Path, timeout: Duration) -> Result<(), VenvError> {
+fn wait_for_marker(
+    marker: &Path,
+    py: &Path,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), VenvError> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if marker.exists() && py.exists() {
-            if let Ok(s) = std::fs::read_to_string(marker) {
-                if s.trim() == VENV_VERSION {
-                    return Ok(());
-                }
-            }
+        if marker_matches(marker, py, expected) {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_secs(2));
     }
@@ -220,13 +253,28 @@ fn wait_for_marker(marker: &Path, py: &Path, timeout: Duration) -> Result<(), Ve
 fn provision(root: &Path) -> Result<(), VenvError> {
     tracing::info!(target: "blut::hf_venv", "provisioning HF venv at {}", root.display());
 
-    let python3 = which::which("python3").map_err(|_| VenvError::PythonMissing {
-        venv_root: root.to_path_buf(),
-    })?;
+    let python3 = if let Ok(path) = std::env::var("BLUT_HF_PYTHON") {
+        PathBuf::from(path)
+    } else {
+        which::which("python3.12")
+            .or_else(|_| which::which("python3"))
+            .map_err(|_| VenvError::PythonMissing {
+                venv_root: root.to_path_buf(),
+            })?
+    };
+    let actual_python = python_minor(&python3)?;
+    if actual_python != LOCKED_PYTHON_MINOR {
+        return Err(VenvError::UnsupportedPython {
+            executable: python3,
+            expected: LOCKED_PYTHON_MINOR,
+            actual: actual_python,
+        });
+    }
 
     let venv_status = Command::new(&python3)
         .arg("-m")
         .arg("venv")
+        .arg("--clear")
         .arg(root)
         .status()
         .map_err(|source| VenvError::Io {
@@ -240,26 +288,17 @@ fn provision(root: &Path) -> Result<(), VenvError> {
         });
     }
 
-    let pip = root.join("bin").join("pip");
-    let mut cmd = Command::new(&pip);
-    cmd.arg("install").arg("--upgrade").arg("pip");
-    let status = cmd.status().map_err(|source| VenvError::Io {
-        path: pip.clone(),
+    let requirements = root.join(REQUIREMENTS_LOCK_FILE);
+    std::fs::write(&requirements, REQUIREMENTS_LOCK).map_err(|source| VenvError::Io {
+        path: requirements.clone(),
         source,
     })?;
-    if !status.success() {
-        return Err(VenvError::PipFailed {
-            status: format!("{status}"),
-        });
-    }
 
-    let mut cmd = Command::new(&pip);
-    cmd.arg("install");
-    for pkg in REQUIRED_PKGS {
-        cmd.arg(pkg);
-    }
+    let python = python_path(root);
+    let mut cmd = Command::new(&python);
+    cmd.args(pip_install_args(&requirements));
     let status = cmd.status().map_err(|source| VenvError::Io {
-        path: pip.clone(),
+        path: python,
         source,
     })?;
     if !status.success() {
@@ -270,6 +309,44 @@ fn provision(root: &Path) -> Result<(), VenvError> {
 
     tracing::info!(target: "blut::hf_venv", "HF venv ready at {}", root.display());
     Ok(())
+}
+
+fn python_minor(python: &Path) -> Result<String, VenvError> {
+    let output = Command::new(python)
+        .args([
+            "-c",
+            "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+        ])
+        .output()
+        .map_err(|source| VenvError::Io {
+            path: python.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(VenvError::PythonProbeFailed {
+            executable: python.to_path_buf(),
+            status: format!("{}", output.status),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn pip_install_args(requirements: &Path) -> Vec<OsString> {
+    [
+        "-m",
+        "pip",
+        "install",
+        "--disable-pip-version-check",
+        "--no-input",
+        "--only-binary=:all:",
+        "--require-hashes",
+        "--no-compile",
+        "--requirement",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .chain(std::iter::once(requirements.as_os_str().to_owned()))
+    .collect()
 }
 
 #[cfg(test)]
@@ -313,5 +390,56 @@ mod tests {
     fn python_path_layout_matches_unix_venv() {
         let root = PathBuf::from("/tmp/x");
         assert_eq!(python_path(&root), PathBuf::from("/tmp/x/bin/python"));
+    }
+
+    #[test]
+    fn provisioning_lock_is_a_sibling_of_the_venv() {
+        let root = PathBuf::from("/tmp/blut/hf-venv");
+        assert_eq!(
+            lock_path(&root),
+            PathBuf::from("/tmp/blut/.hf-venv.blut-provision.lock")
+        );
+    }
+
+    #[test]
+    fn pip_install_is_noninteractive_binary_only_and_hash_locked() {
+        let args = pip_install_args(Path::new("/tmp/requirements.lock"));
+        let args: Vec<_> = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-m",
+                "pip",
+                "install",
+                "--disable-pip-version-check",
+                "--no-input",
+                "--only-binary=:all:",
+                "--require-hashes",
+                "--no-compile",
+                "--requirement",
+                "/tmp/requirements.lock",
+            ]
+        );
+    }
+
+    #[test]
+    fn marker_binds_schema_and_requirements_lock() {
+        let marker = expected_marker();
+        assert!(marker.starts_with("2:3.12:linux-x86_64:"));
+        assert_eq!(marker.rsplit(':').next().map(str::len), Some(64));
+    }
+
+    #[test]
+    fn requirements_are_exact_and_hash_locked() {
+        assert!(REQUIREMENTS_LOCK.contains("torch=="));
+        assert!(REQUIREMENTS_LOCK.contains("pip=="));
+        assert!(REQUIREMENTS_LOCK.contains("--hash=sha256:"));
+        assert!(!REQUIREMENTS_LOCK.contains(">="));
+        for requirement in REQUIRED_PKGS {
+            assert!(REQUIREMENTS_LOCK.contains(requirement));
+        }
     }
 }

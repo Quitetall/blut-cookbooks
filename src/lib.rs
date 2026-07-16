@@ -51,8 +51,8 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 // Convenience re-exports mirroring the engine's old top-level surface,
 // so callers that named these directly keep a single import path.
 pub use backend::{StatusFn, TrainArtifact, TrainBackend};
-pub use backends::{HfTrainerBackend, LamuTrainerBackend, TrainingBackend};
 pub use backends::lamu::python_backend::PythonTrainBackend;
+pub use backends::{HfTrainerBackend, LamuTrainerBackend, TrainingBackend};
 
 // The job/status persistence schema (TrainSpec / StatusUpdate) + the
 // TrainError type stay in the engine (the framework's `jobs.rs` reads
@@ -74,26 +74,50 @@ pub struct StandardCookbook;
 /// Erased ingredient constructors for declarative `.toml` recipe support.
 /// Each entry maps a name → `Arc<dyn StageDyn>` constructor.
 static STANDARD_STAGES_ERASED: &[(&str, blut::framework::stage::ErasedStageCtor)] = &[
-    ("materialize_conversations", || std::sync::Arc::new(stages::MaterializeConversations)),
-    ("materialize_dataset_path", || std::sync::Arc::new(stages::MaterializeDatasetPath)),
-    ("materialize_for_eval", || std::sync::Arc::new(stages::MaterializeForEval)),
-    ("filter_dataset", || std::sync::Arc::new(stages::FilterDataset)),
-    ("split_train_eval", || std::sync::Arc::new(stages::SplitTrainEval)),
-    ("register_dataset", || std::sync::Arc::new(stages::RegisterDataset)),
+    ("materialize_conversations", || {
+        std::sync::Arc::new(stages::MaterializeConversations)
+    }),
+    ("materialize_dataset_path", || {
+        std::sync::Arc::new(stages::MaterializeDatasetPath)
+    }),
+    ("materialize_for_eval", || {
+        std::sync::Arc::new(stages::MaterializeForEval)
+    }),
+    ("filter_dataset", || {
+        std::sync::Arc::new(stages::FilterDataset)
+    }),
+    ("split_train_eval", || {
+        std::sync::Arc::new(stages::SplitTrainEval)
+    }),
+    ("register_dataset", || {
+        std::sync::Arc::new(stages::RegisterDataset)
+    }),
     ("take_train", || std::sync::Arc::new(stages::TakeTrain)),
     ("sft_train", || std::sync::Arc::new(stages::SftTrain)),
     ("dpo_train", || std::sync::Arc::new(stages::DpoTrain)),
-    ("distill_train", || std::sync::Arc::new(stages::DistillTrain)),
+    ("distill_train", || {
+        std::sync::Arc::new(stages::DistillTrain)
+    }),
     ("merge_lora", || std::sync::Arc::new(stages::MergeLora)),
     ("convert_gguf", || std::sync::Arc::new(stages::ConvertGguf)),
-    ("register_model", || std::sync::Arc::new(stages::RegisterModel)),
+    ("register_model", || {
+        std::sync::Arc::new(stages::RegisterModel)
+    }),
     ("eval_loss", || std::sync::Arc::new(stages::EvalLoss)),
-    ("eval_lm_harness", || std::sync::Arc::new(stages::EvalLmHarness)),
+    ("eval_lm_harness", || {
+        std::sync::Arc::new(stages::EvalLmHarness)
+    }),
     ("eval_judge", || std::sync::Arc::new(stages::EvalJudge)),
-    ("merge_reports", || std::sync::Arc::new(stages::MergeReports)),
+    ("merge_reports", || {
+        std::sync::Arc::new(stages::MergeReports)
+    }),
     // HF-backend-specific ingredients
-    ("hf_sft_train", || std::sync::Arc::new(backends::hf_trainer::stages::HfSftTrain)),
-    ("hf_dpo_train", || std::sync::Arc::new(backends::hf_trainer::stages::HfDpoTrain)),
+    ("hf_sft_train", || {
+        std::sync::Arc::new(backends::hf_trainer::stages::HfSftTrain)
+    }),
+    ("hf_dpo_train", || {
+        std::sync::Arc::new(backends::hf_trainer::stages::HfDpoTrain)
+    }),
 ];
 
 impl Cookbook for StandardCookbook {

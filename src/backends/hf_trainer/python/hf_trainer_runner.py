@@ -17,9 +17,9 @@ Wire schema (matches `runner::StatusLine`):
   {"kind":"done","checkpoint_dir":str,"final_loss":float}
   {"kind":"failed","error":str}
 
-Auto-managed venv contract: this script only imports packages
-listed in `runner::REQUIRED_PKGS`. New dep = bump
-`VENV_VERSION` in `venv.rs` so stale envs get rebuilt.
+Auto-managed venv contract: this script only imports packages declared in
+`venv::REQUIRED_PKGS` and resolved by `requirements-hf.lock`. Regenerating the
+lock changes its embedded digest, so stale environments rebuild automatically.
 """
 
 from __future__ import annotations

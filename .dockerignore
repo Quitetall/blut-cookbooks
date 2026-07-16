@@ -1,0 +1,12 @@
+.git
+.gitignore
+.github
+target
+**/target
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.DS_Store
+*.swp
