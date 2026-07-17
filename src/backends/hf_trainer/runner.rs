@@ -133,6 +133,13 @@ pub struct HfRunArtifact {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
+    #[error("child control {operation} failed for pid {pid:?}: {source}")]
+    ChildControl {
+        operation: &'static str,
+        pid: Option<u32>,
+        #[source]
+        source: blut::error::TrainError,
+    },
     #[error("venv: {0}")]
     Venv(#[from] VenvError),
     #[error("python -m hf_trainer_runner spawn at {python}: {source}")]
@@ -171,6 +178,13 @@ impl HfTrainerRunner {
         job: HfTrainerJob,
         on_status: Box<dyn Fn(StatusLine) + Send + Sync>,
     ) -> Result<HfRunArtifact, RunError> {
+        blut::python_kill::ensure_child_spawn_allowed().map_err(|source| {
+            RunError::ChildControl {
+                operation: "spawn preflight",
+                pid: None,
+                source,
+            }
+        })?;
         // Ensure venv (blocking — fine, this only fires on the
         // first hf_* recipe of a session).
         let python = tokio::task::spawn_blocking(ensure_venv)
@@ -240,15 +254,25 @@ impl HfTrainerRunner {
             python: python.display().to_string(),
             source,
         })?;
-        if let Some(pid) = child.id() {
-            *self.child_pid.lock() = Some(pid);
-            // KILL-2: publish for in-process + cross-process cancel.
-            blut::python_kill::register_child(blut::python_kill::capture_identity(pid));
-        }
-
+        let pid = child.id();
         let started = Instant::now();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
+        let registration = match pid {
+            Some(pid) => {
+                blut::python_kill::register_child(blut::python_kill::capture_identity(pid))
+            }
+            None => Err(blut::error::TrainError::other(
+                "spawned HF trainer did not expose a process id",
+            )),
+        };
+        registration.map_err(|source| RunError::ChildControl {
+            operation: "registration",
+            pid,
+            source,
+        })?;
+        *self.child_pid.lock() = pid;
+
         let on_status: Arc<dyn Fn(StatusLine) + Send + Sync> = Arc::from(on_status);
         let collected: Arc<Mutex<(Option<HfRunArtifact>, Option<String>)>> =
             Arc::new(Mutex::new((None, None)));
@@ -345,6 +369,7 @@ impl HfTrainerRunner {
             None => return,
         };
         graceful_kill_pid(pid, Duration::from_secs(10)).await;
+        blut::python_kill::unregister_child(pid);
     }
 }
 
@@ -399,9 +424,8 @@ fn wrapper_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn job_round_trips_via_serde() {
-        let job = HfTrainerJob {
+    fn sample_job() -> HfTrainerJob {
+        HfTrainerJob {
             task: "sft".into(),
             base_model: "Qwen/Qwen3-7B".into(),
             train_dataset_path: "/tmp/train.jsonl".into(),
@@ -421,7 +445,12 @@ mod tests {
             }),
             dpo: None,
             nproc_per_node: 1,
-        };
+        }
+    }
+
+    #[test]
+    fn job_round_trips_via_serde() {
+        let job = sample_job();
         let s = serde_json::to_string(&job).unwrap();
         let back: HfTrainerJob = serde_json::from_str(&s).unwrap();
         assert_eq!(back.task, "sft");
@@ -451,5 +480,42 @@ mod tests {
         // Until then it asserts the path-search code doesn't panic
         // even when none exists.
         let _ = wrapper_path();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn spawn_preflight_refusal_never_publishes_child_pid() {
+        let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock poisoned");
+        let jobs = tempfile::tempdir().unwrap();
+        let previous = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", jobs.path());
+        }
+        let job_id = "hf-preflight-terminal-job";
+        blut::jobs::write_state(job_id, blut::jobs::JobState::Done).unwrap();
+        blut::python_kill::bind_current_job(job_id);
+
+        let mut runner = HfTrainerRunner::new();
+        let result = runner.run(sample_job(), Box::new(|_| {})).await;
+
+        blut::python_kill::unbind_current_job();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", value),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+        assert!(
+            matches!(
+                result,
+                Err(RunError::ChildControl {
+                    operation: "spawn preflight",
+                    pid: None,
+                    ..
+                })
+            ),
+            "unexpected result: {result:?}"
+        );
+        assert!(runner.child_pid.lock().is_none());
     }
 }

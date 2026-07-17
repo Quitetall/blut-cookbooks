@@ -88,6 +88,9 @@ impl PythonTrainBackend {
 impl TrainBackend for PythonTrainBackend {
     async fn run(&mut self, spec: TrainSpec, on_status: StatusFn) -> Result<TrainArtifact> {
         spec.validate()?;
+        blut::python_kill::ensure_child_spawn_allowed().map_err(|error| {
+            TrainError::Trainer(format!("child spawn preflight refused: {error}"))
+        })?;
         let spec_json = serde_json::to_string(&spec)
             .map_err(|e| TrainError::other(format!("serialize TrainSpec for trainer.py: {}", e)))?;
 
@@ -198,14 +201,9 @@ impl TrainBackend for PythonTrainBackend {
                 e
             ))
         })?;
-        if let Some(pid) = child.id() {
-            *self.child_pid.lock() = Some(pid);
-            // KILL-2: publish the child's identity so the in-process
-            // cancel handler + a cross-process `blut cancel` (via the
-            // job pid file) can reach the whole group.
-            blut::python_kill::register_child(blut::python_kill::capture_identity(pid));
-        }
-
+        let pid = child.id().ok_or_else(|| {
+            TrainError::Trainer("spawned trainer did not expose a process id".into())
+        })?;
         let stdout = child
             .stdout
             .take()
@@ -214,6 +212,13 @@ impl TrainBackend for PythonTrainBackend {
             .stderr
             .take()
             .ok_or_else(|| TrainError::Trainer("trainer subprocess stderr pipe missing".into()))?;
+        // KILL-2: registration is the authoritative post-spawn fence. The
+        // engine terminates and reaps a rejected child before returning an
+        // error; publish `child_pid` only after durable registration succeeds.
+        blut::python_kill::register_child(blut::python_kill::capture_identity(pid)).map_err(
+            |error| TrainError::Trainer(format!("register trainer child {pid}: {error}")),
+        )?;
+        *self.child_pid.lock() = Some(pid);
 
         let (artifact_tx, artifact_rx) = oneshot::channel();
         let started = Instant::now();
@@ -384,6 +389,7 @@ impl TrainBackend for PythonTrainBackend {
             None => return Ok(()),
         };
         graceful_kill(pid).await;
+        blut::python_kill::unregister_child(pid);
         Ok(())
     }
 }
@@ -440,6 +446,42 @@ mod tests {
         let p = td.join("fake_trainer.py");
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn spawn_preflight_refusal_never_publishes_child_pid() {
+        let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock poisoned");
+        let Some(py) = python3() else {
+            eprintln!("skip: python3 not found");
+            return;
+        };
+        let td = tempfile::tempdir().unwrap();
+        let jobs = tempfile::tempdir().unwrap();
+        let previous = std::env::var("LAMU_TRAIN_JOBS_DIR").ok();
+        unsafe {
+            std::env::set_var("LAMU_TRAIN_JOBS_DIR", jobs.path());
+        }
+        let job_id = "backend-preflight-terminal-job";
+        blut::jobs::write_state(job_id, blut::jobs::JobState::Done).unwrap();
+        blut::python_kill::bind_current_job(job_id);
+
+        let script = trainer_script(td.path(), "time.sleep(60)");
+        let mut backend = PythonTrainBackend::new(py, script);
+        let result = backend.run(spec(), Box::new(|_| {})).await;
+
+        blut::python_kill::unbind_current_job();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("LAMU_TRAIN_JOBS_DIR", value),
+                None => std::env::remove_var("LAMU_TRAIN_JOBS_DIR"),
+            }
+        }
+        assert!(
+            matches!(result, Err(TrainError::Trainer(ref message)) if message.contains("spawn preflight refused")),
+            "unexpected result: {result:?}"
+        );
+        assert!(backend.child_pid.lock().is_none());
     }
 
     #[tokio::test]

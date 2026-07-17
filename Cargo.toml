@@ -15,7 +15,7 @@ resolver = "2"
 [workspace.dependencies]
 # One reviewed engine pin for every cookbook package. Package-local feature
 # forwarding remains additive, but an engine upgrade changes one revision.
-blut = { git = "https://github.com/Quitetall/blut.git", rev = "be3a2423ad5a2b3cec47567fad9b073e2c54c788" }
+blut = { git = "https://github.com/Quitetall/blut.git", rev = "c160acc934805cb180f01df31a3cc4b72ba13913" }
 
 [package]
 name = "blut-cookbook-standard"

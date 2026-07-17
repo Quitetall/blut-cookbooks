@@ -256,7 +256,7 @@ dependencies = [
 [[package]]
 name = "blut"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=be3a2423ad5a2b3cec47567fad9b073e2c54c788#be3a2423ad5a2b3cec47567fad9b073e2c54c788"
+source = "git+https://github.com/Quitetall/blut.git?rev=c160acc934805cb180f01df31a3cc4b72ba13913#c160acc934805cb180f01df31a3cc4b72ba13913"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -292,6 +292,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -348,7 +349,7 @@ dependencies = [
 [[package]]
 name = "blut-types"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=be3a2423ad5a2b3cec47567fad9b073e2c54c788#be3a2423ad5a2b3cec47567fad9b073e2c54c788"
+source = "git+https://github.com/Quitetall/blut.git?rev=c160acc934805cb180f01df31a3cc4b72ba13913#c160acc934805cb180f01df31a3cc4b72ba13913"
 dependencies = [
  "faster-hex",
  "serde",
@@ -2366,18 +2367,16 @@ dependencies = [
 
 [[package]]
 name = "ratatui"
-version = "0.30.2"
+version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3274ba0a2c5e1bcad2a2005d20f4dc59dad26b2eb0940fb094500dba4099d57d"
+checksum = "d1ce67fb8ba4446454d1c8dbaeda0557ff5e94d39d5e5ed7f10a65eb4c8266bc"
 dependencies = [
  "instability",
  "ratatui-core",
  "ratatui-crossterm",
  "ratatui-macros",
- "ratatui-termina",
  "ratatui-termwiz",
  "ratatui-widgets",
- "serde",
 ]
 
 [[package]]
@@ -2422,17 +2421,6 @@ checksum = "ed7dc68daa7498a43e4d68e0eb078427e10c38fbcfbb1e42d955f1fa2140d814"
 dependencies = [
  "ratatui-core",
  "ratatui-widgets",
-]
-
-[[package]]
-name = "ratatui-termina"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0bf912d9e66f057a759d92e386a280ea886b352ab757d6ac4d653c7ed2c43c2"
-dependencies = [
- "instability",
- "ratatui-core",
- "termina",
 ]
 
 [[package]]
@@ -3147,19 +3135,6 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "termina"
-version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9048a889effe34a5cddee0af7f53285198b16dca3be510858d38dfdb3e62a04e"
-dependencies = [
- "bitflags 2.13.1",
- "parking_lot",
- "rustix 1.1.4",
- "signal-hook",
  "windows-sys 0.61.2",
 ]
 
