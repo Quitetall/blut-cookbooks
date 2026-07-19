@@ -183,12 +183,52 @@ dependencies = [
 [[package]]
 name = "blut"
 version = "0.2.0-alpha.1"
+source = "git+https://github.com/Quitetall/blut.git?rev=3873c9439e45891066f020a2740380cba5a35b48#3873c9439e45891066f020a2740380cba5a35b48"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "blut-types 0.2.0-alpha.1 (git+https://github.com/Quitetall/blut.git?rev=3873c9439e45891066f020a2740380cba5a35b48)",
+ "chrono",
+ "clap",
+ "crossterm 0.28.1",
+ "dirs",
+ "faster-hex",
+ "futures",
+ "fuzzy-matcher",
+ "humantime",
+ "memmap2",
+ "nix",
+ "parking_lot",
+ "rand",
+ "ratatui",
+ "rayon",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "which",
+]
+
+[[package]]
+name = "blut"
+version = "0.2.0-alpha.1"
 source = "git+https://github.com/Quitetall/blut.git?rev=ebe122486cf37a06fa6e7b46db6fe0340e693857#ebe122486cf37a06fa6e7b46db6fe0340e693857"
 dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
- "blut-types",
+ "blut-types 0.2.0-alpha.1 (git+https://github.com/Quitetall/blut.git?rev=ebe122486cf37a06fa6e7b46db6fe0340e693857)",
  "chrono",
  "clap",
  "crossterm 0.28.1",
@@ -226,7 +266,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "blut",
+ "blut 0.2.0-alpha.1 (git+https://github.com/Quitetall/blut.git?rev=ebe122486cf37a06fa6e7b46db6fe0340e693857)",
  "blut-cookbook-standard",
  "schemars",
  "serde",
@@ -244,7 +284,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "blut",
+ "blut 0.2.0-alpha.1 (git+https://github.com/Quitetall/blut.git?rev=3873c9439e45891066f020a2740380cba5a35b48)",
  "dirs",
  "nix",
  "parking_lot",
@@ -259,6 +299,17 @@ dependencies = [
  "tokio",
  "tracing",
  "which",
+]
+
+[[package]]
+name = "blut-types"
+version = "0.2.0-alpha.1"
+source = "git+https://github.com/Quitetall/blut.git?rev=3873c9439e45891066f020a2740380cba5a35b48#3873c9439e45891066f020a2740380cba5a35b48"
+dependencies = [
+ "faster-hex",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
