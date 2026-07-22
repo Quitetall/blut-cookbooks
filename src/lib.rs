@@ -39,6 +39,7 @@ pub mod backend;
 pub mod backends;
 pub mod conversations;
 pub mod convert;
+pub mod recipes;
 pub mod stages;
 
 /// Process-wide lock for tests that mutate environment variables.
@@ -65,6 +66,7 @@ pub use blut::spec::{DatasetSource, Method, Optim, TrainSpec};
 
 use blut::framework::{Cookbook, Registry};
 use blut::recipes::recipe::RecipeDef;
+use recipes::STANDARD_RECIPES;
 
 /// The standard ML cookbook. Registers all generic-LLM ingredients
 /// with the BLUT engine so declarative `.toml` recipes can reference
@@ -111,6 +113,9 @@ static STANDARD_STAGES_ERASED: &[(&str, blut::framework::stage::ErasedStageCtor)
     ("merge_reports", || {
         std::sync::Arc::new(stages::MergeReports)
     }),
+    ("blut_study_fixture", || {
+        std::sync::Arc::new(recipes::StudyFixtureStage)
+    }),
     // HF-backend-specific ingredients
     ("hf_sft_train", || {
         std::sync::Arc::new(backends::hf_trainer::stages::HfSftTrain)
@@ -125,9 +130,7 @@ impl Cookbook for StandardCookbook {
         "standard"
     }
     fn recipes(&self) -> &'static [&'static RecipeDef] {
-        // No built-in recipes — domain cookbooks (blut-lamu, blut-lamquant)
-        // define recipes that compose these ingredients.
-        &[]
+        STANDARD_RECIPES
     }
     fn stages_erased(&self) -> &'static [(&'static str, blut::framework::stage::ErasedStageCtor)] {
         STANDARD_STAGES_ERASED
