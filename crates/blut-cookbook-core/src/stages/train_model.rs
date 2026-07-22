@@ -211,10 +211,10 @@ impl Stage for TrainModel {
         cmd.current_dir(&ctx.stage_dir);
 
         // For DDP: don't pin to a single device — torchrun manages LOCAL_RANK
-        if nproc <= 1 {
-            if let Some(dev) = ctx.device_index {
-                cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
-            }
+        if nproc <= 1
+            && let Some(dev) = ctx.device_index
+        {
+            cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
         }
 
         let status = cmd.status().map_err(|e| {

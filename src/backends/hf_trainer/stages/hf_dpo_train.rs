@@ -3,9 +3,9 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use blut::artifacts::{HfCheckpoint, PreferenceJsonl};
 use crate::backends::HfTrainerBackend;
 use crate::backends::hf_trainer::{DpoConfig, HfTrainerJob, HfTrainerRunner, StatusLine};
+use blut::artifacts::{HfCheckpoint, PreferenceJsonl};
 use blut::framework::artifact::ContentHash;
 use blut::framework::compat::Compatible;
 use blut::framework::error::StageError;
