@@ -10,19 +10,19 @@
 //! Resource::Gpu enforcement); this stage only concerns itself
 //! with running the trainer once it has the GPU.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use blut::artifacts::{DatasetJsonl, HfCheckpoint};
 use crate::backend::TrainBackend;
+use crate::backends::lamu::python_backend::PythonTrainBackend;
+use blut::artifacts::{DatasetJsonl, HfCheckpoint};
 use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
 use blut::paths;
-use crate::backends::lamu::python_backend::PythonTrainBackend;
 use blut::spec::{DatasetSource, Method, Optim, TrainSpec};
 
 pub struct SftTrain;
@@ -174,4 +174,4 @@ impl Stage for SftTrain {
 }
 
 #[allow(dead_code)]
-fn _path_marker(_p: &PathBuf) {}
+fn _path_marker(_p: &Path) {}

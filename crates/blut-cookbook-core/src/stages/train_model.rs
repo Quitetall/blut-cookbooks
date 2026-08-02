@@ -132,8 +132,8 @@ impl Stage for TrainModel {
         }
         if !input.path.exists() {
             return Err(StageError::BadInput(format!(
-                "dataset not found: {}",
-                input.path.display()
+                "dataset not found: {path}",
+                path = input.path.display()
             )));
         }
 
@@ -218,13 +218,12 @@ impl Stage for TrainModel {
         }
 
         let status = cmd.status().map_err(|e| {
-            StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {}", e))
+            StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {e}"))
         })?;
 
         if !status.success() {
             return Err(StageError::Backend(anyhow::anyhow!(
-                "blut_core.trainer exited with {}",
-                status
+                "blut_core.trainer exited with {status}"
             )));
         }
 
@@ -235,13 +234,13 @@ impl Stage for TrainModel {
                 .map_or(true, |mut d| d.next().is_none())
         {
             return Err(StageError::Backend(anyhow::anyhow!(
-                "trainer did not produce checkpoint in {}",
-                output_dir.display()
+                "trainer did not produce checkpoint in {output_dir}",
+                output_dir = output_dir.display()
             )));
         }
 
         let content_hash = ContentHash::hash_dir(&output_dir)
-            .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {}", e)))?;
+            .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {e}")))?;
 
         Ok(HfCheckpoint {
             path: output_dir,

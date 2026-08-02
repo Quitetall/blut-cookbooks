@@ -63,14 +63,14 @@ impl Stage for LoadDataset {
                     .any(|c| matches!(c, std::path::Component::ParentDir))
                 {
                     return Err(StageError::BadInput(format!(
-                        "path '{}' contains '..' — refusing",
-                        p.display()
+                        "path '{p}' contains '..' — refusing",
+                        p = p.display()
                     )));
                 }
                 if !p.exists() {
                     return Err(StageError::BadInput(format!(
-                        "dataset path not found: {}",
-                        p.display()
+                        "dataset path not found: {p}",
+                        p = p.display()
                     )));
                 }
                 let content_hash = ContentHash::hash_file(p).map_err(|source| StageError::Io {
@@ -106,14 +106,12 @@ impl Stage for LoadDataset {
                 }
                 let status = cmd.status().map_err(|e| {
                     StageError::Backend(anyhow::anyhow!(
-                        "failed to run blut_core.load_dataset: {}",
-                        e
+                        "failed to run blut_core.load_dataset: {e}"
                     ))
                 })?;
                 if !status.success() {
                     return Err(StageError::Backend(anyhow::anyhow!(
-                        "blut_core.load_dataset exited with {}",
-                        status
+                        "blut_core.load_dataset exited with {status}"
                     )));
                 }
                 if !output_path.exists() {

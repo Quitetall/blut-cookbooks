@@ -163,7 +163,7 @@ async fn run_surfaces_trainer_failed_status() {
     let result = backend.run(dummy_spec(), on_status).await;
 
     let err = result.expect_err("expected TrainError when torch is missing");
-    let msg = format!("{}", err);
+    let msg = format!("{err}");
     let updates = collected.lock().unwrap();
     assert!(
         msg.contains("missing python deps")
@@ -171,8 +171,7 @@ async fn run_surfaces_trainer_failed_status() {
             || updates
                 .iter()
                 .any(|u| matches!(u, StatusUpdate::Failed { .. })),
-        "unexpected error shape: {}",
-        msg
+        "unexpected error shape: {msg}",
     );
 }
 
