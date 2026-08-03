@@ -158,7 +158,7 @@ dependencies = [
 [[package]]
 name = "blut"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=704d3b3542150e91fa9767a0d286983940ca3788#704d3b3542150e91fa9767a0d286983940ca3788"
+source = "git+https://github.com/Quitetall/blut.git?rev=843fd1a9818d001e68c46fdb9537121db86a3011#843fd1a9818d001e68c46fdb9537121db86a3011"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -238,7 +238,7 @@ dependencies = [
 [[package]]
 name = "blut-graph-core"
 version = "0.1.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=704d3b3542150e91fa9767a0d286983940ca3788#704d3b3542150e91fa9767a0d286983940ca3788"
+source = "git+https://github.com/Quitetall/blut.git?rev=843fd1a9818d001e68c46fdb9537121db86a3011#843fd1a9818d001e68c46fdb9537121db86a3011"
 dependencies = [
  "blake3",
  "postcard",
@@ -248,7 +248,7 @@ dependencies = [
 [[package]]
 name = "blut-types"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=704d3b3542150e91fa9767a0d286983940ca3788#704d3b3542150e91fa9767a0d286983940ca3788"
+source = "git+https://github.com/Quitetall/blut.git?rev=843fd1a9818d001e68c46fdb9537121db86a3011#843fd1a9818d001e68c46fdb9537121db86a3011"
 dependencies = [
  "faster-hex",
  "schemars",
