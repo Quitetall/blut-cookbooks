@@ -9,14 +9,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use blut::artifacts::{DatasetJsonl, HfCheckpoint};
-use crate::backend::TrainBackend;
-use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
-use blut::paths;
-use crate::backends::lamu::python_backend::PythonTrainBackend;
-use blut::spec::{DatasetSource, Method, Optim, TrainSpec};
 
 pub struct DistillTrain;
 
@@ -48,87 +43,14 @@ impl Stage for DistillTrain {
         input: (HfCheckpoint, DatasetJsonl),
         args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
-        // R21 pre + R23.
-        debug_assert!(input.1.n_examples > 0, "distill dataset must have examples");
-        if !(args.kl_weight >= 0.0 && args.kl_weight <= 1.0) {
-            return Err(StageError::BadInput(format!(
-                "kl_weight must be in [0, 1]; got {}",
-                args.kl_weight
-            )));
-        }
-        if args.epochs == 0 || args.batch_size == 0 || args.grad_accum == 0 {
-            return Err(StageError::BadInput(
-                "epochs/batch_size/grad_accum must be > 0".into(),
-            ));
-        }
-        if !(args.lr > 0.0 && args.lr.is_finite()) {
-            return Err(StageError::BadInput(format!(
-                "lr must be positive finite; got {}",
-                args.lr
-            )));
-        }
-        let (teacher, dataset) = input;
-        let output_dir = ctx.stage_dir.join("checkpoint");
-        std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {
-            path: output_dir.clone(),
-            source,
-        })?;
-
-        let spec = TrainSpec {
-            base_model: args.student_base.clone(),
-            output_name: args.output_name.clone(),
-            output_dir: output_dir.clone(),
-            method: Method::QLora {
-                rank: 16,
-                alpha: 32,
-            },
-            dataset: DatasetSource::JsonlPath {
-                path: dataset.path.clone(),
-            },
-            optimizer: Optim::AdamW8bit,
-            lr: args.lr,
-            epochs: args.epochs,
-            batch_size: args.batch_size,
-            grad_accum: args.grad_accum,
-            seq_len: args.seq_len,
-            seed: args.seed,
-            quant: "Q4_K_M".into(),
-            skip_convert: true,
-            nproc_per_node: 1,
-            nnodes: 1,
-            dpo_beta: None,
-        };
-        spec.validate()
-            .map_err(|e| StageError::BadInput(format!("{e}")))?;
-
-        let python =
-            paths::resolve_python().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-        let trainer_script = paths::resolve_trainer_script_named("trainer_distill.py")
-            .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-        let mut backend = PythonTrainBackend::new(python, trainer_script)
-            .with_env(
-                "LAMU_TEACHER_PATH",
-                teacher.path.to_string_lossy().into_owned(),
-            )
-            .with_env("LAMU_KL_WEIGHT", format!("{}", args.kl_weight));
-        let on_status: crate::backend::StatusFn = Box::new(|_u| {});
-
-        let artifact = backend
-            .run(spec.clone(), on_status)
-            .await
-            .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-
-        let hash = ContentHash::hash_dir(&output_dir).map_err(|source| StageError::Io {
-            path: output_dir.clone(),
-            source,
-        })?;
-
-        Ok(HfCheckpoint {
-            path: output_dir,
-            base_model: args.student_base.clone(),
-            method_tag: "distill".into(),
-            content_hash: hash,
-            final_loss: artifact.final_loss,
-        })
-    }
+        // ADR 0037 Stage 5: the trainer_distill.py stub was deleted rather
+        // than completed ("delete, don't complete"). This legacy stage is
+        // retained only so old recipes fail with guidance instead of a
+        // resolver mystery; it never trained anything real.
+        let _ = (ctx, input, args);
+        Err(StageError::BadInput(
+            "the trainer_distill.py stub was removed (ADR 0037 Stage 5) — use the blut-lamu distill_bitnet stage (ternary) or hf_sft_train (HF-base) instead"
+                .into(),
+        ))
+}
 }

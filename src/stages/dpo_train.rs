@@ -9,14 +9,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use blut::artifacts::{HfCheckpoint, PreferenceJsonl};
-use crate::backend::TrainBackend;
-use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
-use blut::paths;
-use crate::backends::lamu::python_backend::PythonTrainBackend;
-use blut::spec::{DatasetSource, Method, Optim, TrainSpec};
 
 pub struct DpoTrain;
 
@@ -49,77 +44,14 @@ impl Stage for DpoTrain {
         input: PreferenceJsonl,
         args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
-        // R21 pre + R23.
-        debug_assert!(input.n_pairs > 0, "dpo input must have preference pairs");
-        if !(args.beta > 0.0 && args.beta.is_finite()) {
-            return Err(StageError::BadInput(format!(
-                "beta must be positive finite; got {}",
-                args.beta
-            )));
-        }
-        if args.epochs == 0 {
-            return Err(StageError::BadInput("epochs must be > 0".into()));
-        }
-        let output_dir = ctx.stage_dir.join("checkpoint");
-        std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {
-            path: output_dir.clone(),
-            source,
-        })?;
-
-        let spec = TrainSpec {
-            base_model: args.base_model.clone(),
-            output_name: args.output_name.clone(),
-            output_dir: output_dir.clone(),
-            method: Method::QLora {
-                rank: 16,
-                alpha: 32,
-            },
-            dataset: DatasetSource::JsonlPath {
-                path: input.path.clone(),
-            },
-            optimizer: Optim::AdamW8bit,
-            lr: args.lr,
-            epochs: args.epochs,
-            batch_size: args.batch_size,
-            grad_accum: args.grad_accum,
-            seq_len: args.seq_len,
-            seed: args.seed,
-            quant: "Q4_K_M".into(),
-            skip_convert: true,
-            nproc_per_node: 1,
-            nnodes: 1,
-            // Thread the DPO temperature through to the trainer (was dropped).
-            dpo_beta: Some(args.beta),
-        };
-        spec.validate()
-            .map_err(|e| StageError::BadInput(format!("{e}")))?;
-
-        let python =
-            paths::resolve_python().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-        let trainer_script = paths::resolve_trainer_script_named("trainer_dpo.py")
-            .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-        let mut backend = PythonTrainBackend::new(python, trainer_script);
-        let on_status: crate::backend::StatusFn = Box::new(|_u| {});
-
-        // beta is now carried on the spec (spec.dpo_beta) and serialized to
-        // the trainer verbatim — no out-of-band channel.
-
-        let artifact = backend
-            .run(spec.clone(), on_status)
-            .await
-            .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-
-        let hash = ContentHash::hash_dir(&output_dir).map_err(|source| StageError::Io {
-            path: output_dir.clone(),
-            source,
-        })?;
-
-        Ok(HfCheckpoint {
-            path: output_dir,
-            base_model: args.base_model.clone(),
-            method_tag: "dpo".into(),
-            content_hash: hash,
-            final_loss: artifact.final_loss,
-        })
-    }
+        // ADR 0037 Stage 5: the trainer_dpo.py stub was deleted rather
+        // than completed ("delete, don't complete"). This legacy stage is
+        // retained only so old recipes fail with guidance instead of a
+        // resolver mystery; it never trained anything real.
+        let _ = (ctx, input, args);
+        Err(StageError::BadInput(
+            "the trainer_dpo.py stub was removed (ADR 0037 Stage 5) — use hf_dpo_train (trl DPOTrainer) instead"
+                .into(),
+        ))
+}
 }
