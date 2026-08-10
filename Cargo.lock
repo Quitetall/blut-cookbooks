@@ -132,7 +132,7 @@ dependencies = [
 [[package]]
 name = "blut"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=82fc8f0a82cfde099a1702f7d1194be7417ebfe8#82fc8f0a82cfde099a1702f7d1194be7417ebfe8"
+source = "git+https://github.com/Quitetall/blut.git?rev=6141e66f9b197239994d1c5260f4e15dbb822420#6141e66f9b197239994d1c5260f4e15dbb822420"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -211,7 +211,7 @@ dependencies = [
 [[package]]
 name = "blut-types"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=82fc8f0a82cfde099a1702f7d1194be7417ebfe8#82fc8f0a82cfde099a1702f7d1194be7417ebfe8"
+source = "git+https://github.com/Quitetall/blut.git?rev=6141e66f9b197239994d1c5260f4e15dbb822420#6141e66f9b197239994d1c5260f4e15dbb822420"
 dependencies = [
  "faster-hex",
  "schemars",
