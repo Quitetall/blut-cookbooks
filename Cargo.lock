@@ -179,10 +179,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "tokio",
  "tracing",
- "which",
 ]
 
 [[package]]
@@ -200,7 +198,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror",
  "tokio",

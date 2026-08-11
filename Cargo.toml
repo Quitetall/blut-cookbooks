@@ -47,7 +47,6 @@ tracing = "0.1"
 parking_lot = "0.12"
 nix = { version = "0.29", features = ["signal", "process"] }
 dirs = "5"
-sha2 = "0.10"
 which = "6"
 rand = "0.8"
 # conversations.rs reads the lamu conversation DB; atomic JSONL writes
