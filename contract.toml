@@ -16,8 +16,9 @@ owner = "blut-backends"
 description = """
 The shared cookbook backends: blut-cookbook-core and blut-cookbook-standard.
 """
-argv = ["cargo", "test", "--workspace", "--no-fail-fast"]
+argv = ["python3", "python/run_owner_tests.py"]
 timeout_seconds = 1200
+source_paths = ["training/backends/python"]
 
 # RATCHET, not a waiver. Measured 2026-08-10: 93 passed, 0 failed.
 #
@@ -29,6 +30,7 @@ max_failures = 0
 # including passing ones — an obligation that answers `ok` while a whole tree
 # goes unasked reads as full coverage.
 scope_note = """
-The 9 Python test files here are not run: they import `blut_core`, which is
-not installed in a bare checkout (3 collection errors). Tracked.
+All Rust tests and the run-manifest Python suite migrated by ADR 0092 A02 run.
+The 9 remaining Python suites stay outside this obligation until their
+`blut_core` dependency combinations become hermetic.
 """
