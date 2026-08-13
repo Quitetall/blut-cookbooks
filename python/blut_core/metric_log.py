@@ -11,7 +11,9 @@ only written at close()).
 Design constraints:
 - stdlib-only at import time (no torch / pyarrow / wandb at module top); pyarrow
   is lazy-imported in ``_detect`` so importing this module is always cheap+safe.
-- ``append`` NEVER raises — a logging failure must not crash a training run.
+- ``append`` is best-effort by default so legacy trainers keep their historical
+  behavior. An authoritative persistence lane can opt into ``raise_on_error``
+  and surface append/final-flush failures to its bounded sink.
 - values are coerced to JSON/columnar-safe scalars so one bad row can't poison
   every subsequent flush.
 """
@@ -39,12 +41,20 @@ def _safe_scalar(v: Any) -> Any:
 class MetricLog:
     """Append-only per-epoch metric stream, atomically rewritten each append."""
 
-    def __init__(self, run_id: str, log_dir, basename: str = "metrics") -> None:
+    def __init__(
+        self,
+        run_id: str,
+        log_dir,
+        basename: str = "metrics",
+        *,
+        raise_on_error: bool = False,
+    ) -> None:
         if not run_id or not isinstance(run_id, str):
             raise ValueError(f"run_id must be a non-empty str, got {run_id!r}")
         self.run_id = run_id
         self.log_dir = Path(log_dir)
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.raise_on_error = raise_on_error
         self._rows: List[Dict[str, Any]] = []
         self._backend = self._detect()  # 'parquet' if pyarrow importable else 'csv'
         ext = "parquet" if self._backend == "parquet" else "csv"
@@ -62,18 +72,24 @@ class MetricLog:
     def append(self, row: Dict[str, Any]) -> None:
         """Add one metric row and rewrite the whole file atomically.
 
-        Wrapped end-to-end: logging must never crash a training run."""
+        Legacy mode logs and suppresses failures. ``raise_on_error=True``
+        propagates them so an authoritative bounded lane cannot lose an
+        accepted record while reporting success."""
         try:
             self._rows.append({str(k): _safe_scalar(v) for k, v in dict(row).items()})
             self._flush()
         except Exception as e:  # pragma: no cover - defensive
+            if self.raise_on_error:
+                raise
             print(f"[!] metric_log append failed (non-fatal): {e}")
 
     def close(self) -> None:
-        """Final flush. Idempotent; never raises."""
+        """Final flush. Idempotent; strict mode propagates flush failures."""
         try:
             self._flush()
         except Exception as e:  # pragma: no cover - defensive
+            if self.raise_on_error:
+                raise
             print(f"[!] metric_log close failed (non-fatal): {e}")
 
     # ------------------------------------------------------------------

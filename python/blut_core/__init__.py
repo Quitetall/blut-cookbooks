@@ -2,6 +2,7 @@
 
 The package contains domain-agnostic building blocks reusable by any cookbook:
 
+- ``async_io``     — bounded, backpressured delivery for persistence work
 - ``runctx``       — run identity + filesystem anchors from the BLUT env (P10)
 - ``MetricLog``    — atomic per-epoch CSV/Parquet metric writer
 - ``read_metric``  — verbatim metric/log reader (no LLM in the path; ADR 0038)
@@ -27,7 +28,7 @@ from blut_core.spec import KINDS, IngredientSpec
 # Register generic ingredient specs on package import.
 from blut_core.ingredients import _specs as _ingredient_specs  # noqa: F401
 
-from . import checkpoint, runctx, status, sysgauge
+from . import async_io, checkpoint, runctx, status, sysgauge
 from .metric_log import MetricLog
 from .run_manifest import RunManifest
 
@@ -40,6 +41,7 @@ __all__ = [
     "KINDS",
     "MetricLog",
     "RunManifest",
+    "async_io",
     "build_ingredient",
     "checkpoint",
     "get_spec",
