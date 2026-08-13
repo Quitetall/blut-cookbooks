@@ -13,7 +13,9 @@ from typing import Sequence
 ROOT = Path(__file__).resolve().parents[1]
 OWNER_PYTHON_TESTS = (
     "python/tests/test_run_manifest.py",
+    "python/blut_core/tests/test_async_compute.py",
     "python/blut_core/tests/test_async_io_contract.py",
+    "python/blut_core/tests/test_parallel_strategy.py",
 )
 
 
