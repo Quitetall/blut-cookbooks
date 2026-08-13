@@ -13,6 +13,7 @@ import pytest
 
 from blut_core.async_io import (
     AsyncSink,
+    AsyncSinkWorkerError,
     Bounded,
     Inline,
     ItemTooLargeError,
@@ -262,7 +263,7 @@ def test_blocked_submit_surfaces_worker_failure_before_retaining() -> None:
     assert not producer.is_alive()
     assert [str(error) for error in submit_errors] == ["first write failed"]
     assert retained == ["first"]
-    with pytest.raises(RuntimeError, match="first write failed"):
+    with pytest.raises(AsyncSinkWorkerError, match="first write failed"):
         sink.close()
 
 
