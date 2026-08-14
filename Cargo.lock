@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "abir"
 version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=e2115200e0e4f284c38aa2afd4578a204cc8f40d#e2115200e0e4f284c38aa2afd4578a204cc8f40d"
+source = "git+https://github.com/Quitetall/ABIR.git?rev=7e5700e9ef4e5c7c6a42d829196cd2d0a642f647#7e5700e9ef4e5c7c6a42d829196cd2d0a642f647"
 dependencies = [
  "blake3",
  "serde_json",
@@ -14,7 +14,7 @@ dependencies = [
 [[package]]
 name = "abir-bcs"
 version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=e2115200e0e4f284c38aa2afd4578a204cc8f40d#e2115200e0e4f284c38aa2afd4578a204cc8f40d"
+source = "git+https://github.com/Quitetall/ABIR.git?rev=7e5700e9ef4e5c7c6a42d829196cd2d0a642f647#7e5700e9ef4e5c7c6a42d829196cd2d0a642f647"
 dependencies = [
  "abir",
  "blake3",
@@ -28,7 +28,7 @@ dependencies = [
 [[package]]
 name = "abir-training"
 version = "0.1.0"
-source = "git+https://github.com/Quitetall/ABIR.git?rev=e2115200e0e4f284c38aa2afd4578a204cc8f40d#e2115200e0e4f284c38aa2afd4578a204cc8f40d"
+source = "git+https://github.com/Quitetall/ABIR.git?rev=7e5700e9ef4e5c7c6a42d829196cd2d0a642f647#7e5700e9ef4e5c7c6a42d829196cd2d0a642f647"
 dependencies = [
  "abir",
  "abir-bcs",
@@ -202,7 +202,7 @@ dependencies = [
 [[package]]
 name = "blut"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=0d633c4b7cf5f5ecb45e410a2576d8dc7f8aa33e#0d633c4b7cf5f5ecb45e410a2576d8dc7f8aa33e"
+source = "git+https://github.com/Quitetall/blut.git?rev=166ffc02d7ec6fb011d72b5ff685b8d9e347221d#166ffc02d7ec6fb011d72b5ff685b8d9e347221d"
 dependencies = [
  "abir",
  "abir-training",
@@ -280,7 +280,7 @@ dependencies = [
 [[package]]
 name = "blut-types"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=0d633c4b7cf5f5ecb45e410a2576d8dc7f8aa33e#0d633c4b7cf5f5ecb45e410a2576d8dc7f8aa33e"
+source = "git+https://github.com/Quitetall/blut.git?rev=166ffc02d7ec6fb011d72b5ff685b8d9e347221d#166ffc02d7ec6fb011d72b5ff685b8d9e347221d"
 dependencies = [
  "faster-hex",
  "schemars",
