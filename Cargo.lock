@@ -202,7 +202,7 @@ dependencies = [
 [[package]]
 name = "blut"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=b747dfec59d0ba1d91632d61a40ec88e1c845fb2#b747dfec59d0ba1d91632d61a40ec88e1c845fb2"
+source = "git+https://github.com/Quitetall/blut.git?rev=2163f746b803e2f36cc8fe68bd809ebe0a67f3a3#2163f746b803e2f36cc8fe68bd809ebe0a67f3a3"
 dependencies = [
  "abir",
  "abir-training",
@@ -280,7 +280,7 @@ dependencies = [
 [[package]]
 name = "blut-types"
 version = "0.2.0-alpha.1"
-source = "git+https://github.com/Quitetall/blut.git?rev=b747dfec59d0ba1d91632d61a40ec88e1c845fb2#b747dfec59d0ba1d91632d61a40ec88e1c845fb2"
+source = "git+https://github.com/Quitetall/blut.git?rev=2163f746b803e2f36cc8fe68bd809ebe0a67f3a3#2163f746b803e2f36cc8fe68bd809ebe0a67f3a3"
 dependencies = [
  "faster-hex",
  "schemars",
