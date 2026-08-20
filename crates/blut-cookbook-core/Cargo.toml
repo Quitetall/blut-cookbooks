@@ -23,7 +23,7 @@ name = "blut-core"
 path = "src/main.rs"
 
 [dependencies]
-blut = { git = "https://github.com/Quitetall/blut.git", rev = "f5403b9d45585544f6d2f5d1a34e048915b2545d" }
+blut = { git = "https://github.com/Quitetall/blut.git", rev = "33b3e047fd8eae50c4f706e7e3c7f4a3648a5778" }
 blut-backends = { package = "blut-cookbook-standard", path = "../.." }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
