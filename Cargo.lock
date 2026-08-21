@@ -163,7 +163,46 @@ dependencies = [
  "async-trait",
  "bincode",
  "blake3",
- "blut-types",
+ "blut-types 0.2.0-alpha.1 (git+https://github.com/Quitetall/blut.git?rev=33b3e047fd8eae50c4f706e7e3c7f4a3648a5778)",
+ "chrono",
+ "clap",
+ "cron",
+ "dirs",
+ "faster-hex",
+ "futures",
+ "humantime",
+ "memmap2",
+ "nix",
+ "parking_lot",
+ "rand",
+ "rayon",
+ "rusqlite",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "which",
+]
+
+[[package]]
+name = "blut"
+version = "0.2.0-alpha.1"
+source = "git+https://github.com/Quitetall/blut.git?rev=54cc9b427446de3961058ff6f430e5c5f6916615#54cc9b427446de3961058ff6f430e5c5f6916615"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bincode",
+ "blake3",
+ "blut-types 0.2.0-alpha.1 (git+https://github.com/Quitetall/blut.git?rev=54cc9b427446de3961058ff6f430e5c5f6916615)",
  "chrono",
  "clap",
  "cron",
@@ -199,7 +238,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "blut",
+ "blut 0.2.0-alpha.1 (git+https://github.com/Quitetall/blut.git?rev=33b3e047fd8eae50c4f706e7e3c7f4a3648a5778)",
  "blut-cookbook-standard",
  "schemars",
  "serde",
@@ -215,7 +254,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "blut",
+ "blut 0.2.0-alpha.1 (git+https://github.com/Quitetall/blut.git?rev=54cc9b427446de3961058ff6f430e5c5f6916615)",
  "dirs",
  "nix",
  "parking_lot",
@@ -235,6 +274,18 @@ dependencies = [
 name = "blut-types"
 version = "0.2.0-alpha.1"
 source = "git+https://github.com/Quitetall/blut.git?rev=33b3e047fd8eae50c4f706e7e3c7f4a3648a5778#33b3e047fd8eae50c4f706e7e3c7f4a3648a5778"
+dependencies = [
+ "faster-hex",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "blut-types"
+version = "0.2.0-alpha.1"
+source = "git+https://github.com/Quitetall/blut.git?rev=54cc9b427446de3961058ff6f430e5c5f6916615#54cc9b427446de3961058ff6f430e5c5f6916615"
 dependencies = [
  "faster-hex",
  "schemars",
