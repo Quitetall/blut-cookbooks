@@ -1,0 +1,45 @@
+blut-backends
+Copyright 2026 Brian Lam
+
+This product includes software developed for the BLUT project.
+
+--------------------------------------------------------------------------
+Licensing, and what it does and does not give you
+--------------------------------------------------------------------------
+
+This repository is NOT under a single license. Read this before assuming
+what you may do with it.
+
+  crate                     license               path
+  ------------------------  --------------------  ---------------------------
+  blut-cookbook-standard    Apache-2.0            . (repository root)
+  blut-cookbook-core        AGPL-3.0-or-later     crates/blut-cookbook-core
+
+`blut-cookbook-standard` is Apache-2.0. That covers THIS crate's own source.
+
+**It does not make your combined work permissively licensed.** This crate
+exists to be linked against the BLUT engine (`blut`, github.com/Quitetall/blut),
+which is **AGPL-3.0-or-later**. The AGPL is a strong copyleft license with a
+network clause: if you distribute a work built from it, or offer it to users
+over a network, the AGPL's obligations apply to that combined work — including
+making the corresponding source available. Apache-2.0 on this crate does not
+switch that off, and nothing here should be read as suggesting it does.
+
+The reason both licenses appear at all is that the copyright holder is the
+same for all of it and may license their own code more than one way. What a
+DOWNSTREAM user receives is the intersection: you get Apache-2.0 terms for the
+code in this crate, and AGPL terms for anything you build that incorporates
+the engine.
+
+If you want the permissive parts without the copyleft obligations, you need a
+build that does not link the AGPL engine. This crate is not that build — its
+whole purpose is the engine's backend seam.
+
+--------------------------------------------------------------------------
+Third-party dependencies
+--------------------------------------------------------------------------
+
+Dependency licenses are enforced in CI by `cargo-deny` (see the audit
+workflow), which fails on any license outside the allowed set. That check
+covers the dependency graph; it does not and cannot decide the question above,
+which is about how THIS code is combined with the engine.
