@@ -28,6 +28,18 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      # `blut` is a private git dependency; cargo's own fetch needs a credential
+      # that can read it. SUBMODULE_TOKEN is the fleet's read-only PAT (the same
+      # secret name the LamQuant meta uses); github.token is the fallback and
+      # cannot read a sibling private repository, so until that secret exists on
+      # this repository the clippy/test steps fail at dependency resolution.
+      - name: Authenticate cargo git fetches
+        env:
+          GH_FLEET_TOKEN: ${{ secrets.SUBMODULE_TOKEN || github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GH_FLEET_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked --workspace --no-fail-fast
