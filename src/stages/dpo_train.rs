@@ -53,5 +53,5 @@ impl Stage for DpoTrain {
             "the trainer_dpo.py stub was removed (ADR 0037 Stage 5) — use hf_dpo_train (trl DPOTrainer) instead"
                 .into(),
         ))
-}
+    }
 }

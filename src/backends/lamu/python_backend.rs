@@ -97,7 +97,7 @@ impl TrainBackend for PythonTrainBackend {
         //
         // DDP: when nproc_per_node > 1, launch via `torchrun --nproc_per_node=N`
         // instead of bare python, so the trainer auto-initializes DDP.
-        use blut::config::launcher::{launcher_for, LaunchTarget};
+        use blut::config::launcher::{LaunchTarget, launcher_for};
         let nproc = spec.nproc_per_node.max(1);
         let nnodes = spec.nnodes.max(1);
         let mut cmd = match self.launch_target {
@@ -111,18 +111,22 @@ impl TrainBackend for PythonTrainBackend {
                         c.args(["--standalone", "--nproc_per_node", &nproc.to_string()]);
                     } else {
                         // Multi-node DDP: read rendezvous from env
-                        let master_addr = std::env::var("MASTER_ADDR")
-                            .unwrap_or_else(|_| "127.0.0.1".into());
-                        let master_port = std::env::var("MASTER_PORT")
-                            .unwrap_or_else(|_| "29500".into());
-                        let node_rank = std::env::var("NODE_RANK")
-                            .unwrap_or_else(|_| "0".into());
+                        let master_addr =
+                            std::env::var("MASTER_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
+                        let master_port =
+                            std::env::var("MASTER_PORT").unwrap_or_else(|_| "29500".into());
+                        let node_rank = std::env::var("NODE_RANK").unwrap_or_else(|_| "0".into());
                         c.args([
-                            "--nnodes", &nnodes.to_string(),
-                            "--nproc_per_node", &nproc.to_string(),
-                            "--rdzv_backend", "c10d",
-                            "--rdzv_endpoint", &format!("{master_addr}:{master_port}"),
-                            "--node_rank", &node_rank,
+                            "--nnodes",
+                            &nnodes.to_string(),
+                            "--nproc_per_node",
+                            &nproc.to_string(),
+                            "--rdzv_backend",
+                            "c10d",
+                            "--rdzv_endpoint",
+                            &format!("{master_addr}:{master_port}"),
+                            "--node_rank",
+                            &node_rank,
                         ]);
                     }
                 }
@@ -130,10 +134,8 @@ impl TrainBackend for PythonTrainBackend {
                 c
             }
             target => {
-                let mut inner_args = vec![
-                    self.trainer_script.display().to_string(),
-                    spec_json.clone(),
-                ];
+                let mut inner_args =
+                    vec![self.trainer_script.display().to_string(), spec_json.clone()];
                 // For DDP on Slurm/Ray: prepend torchrun args
                 let inner_prog = if nproc > 1 {
                     inner_args.insert(0, "torch.distributed.run".to_string());
@@ -405,7 +407,10 @@ mod tests {
             base_model: "org/m".into(),
             output_name: "wd-test".into(),
             output_dir: PathBuf::from("/tmp/blut-wd-test"),
-            method: Method::QLora { rank: 16, alpha: 32 },
+            method: Method::QLora {
+                rank: 16,
+                alpha: 32,
+            },
             dataset: DatasetSource::JsonlPath {
                 path: PathBuf::from("/tmp/x.jsonl"),
             },
@@ -447,8 +452,8 @@ mod tests {
         // Prints one Step, then goes silent for 60s — the watchdog must
         // kill it well before that.
         let script = trainer_script(td.path(), "time.sleep(60)");
-        let mut backend = PythonTrainBackend::new(py, script)
-            .with_liveness_timeout(Duration::from_millis(500));
+        let mut backend =
+            PythonTrainBackend::new(py, script).with_liveness_timeout(Duration::from_millis(500));
         let on_status: StatusFn = Box::new(|_u| {});
         let fut = backend.run(spec(), on_status);
         let r = tokio::time::timeout(Duration::from_secs(10), fut)
@@ -481,8 +486,8 @@ mod tests {
             ckpt.display()
         );
         let script = trainer_script(td.path(), &tail);
-        let mut backend = PythonTrainBackend::new(py, script)
-            .with_liveness_timeout(Duration::from_millis(500));
+        let mut backend =
+            PythonTrainBackend::new(py, script).with_liveness_timeout(Duration::from_millis(500));
         let on_status: StatusFn = Box::new(|_u| {});
         let r = tokio::time::timeout(Duration::from_secs(10), backend.run(spec(), on_status))
             .await

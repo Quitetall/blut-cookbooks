@@ -76,7 +76,9 @@ pub struct HfTrainerJob {
     pub nproc_per_node: u32,
 }
 
-fn default_nproc() -> u32 { 1 }
+fn default_nproc() -> u32 {
+    1
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeftConfig {
@@ -211,9 +213,11 @@ impl HfTrainerRunner {
         let mut cmd = Command::new(&python);
         if nproc > 1 {
             cmd.args([
-                "-m", "torch.distributed.run",
+                "-m",
+                "torch.distributed.run",
                 "--standalone",
-                "--nproc_per_node", &nproc.to_string(),
+                "--nproc_per_node",
+                &nproc.to_string(),
             ]);
         }
         cmd.arg(&wrapper).arg(&spec_path);
@@ -304,15 +308,15 @@ impl HfTrainerRunner {
             path: PathBuf::from("hf-trainer-wait"),
             source,
         })?;
-        if let Some(h) = stdout_handle {
-            if let Err(e) = h.await {
-                tracing::error!(target: "blut::hf_trainer", "stdout reader join failed: {e}");
-            }
+        if let Some(h) = stdout_handle
+            && let Err(e) = h.await
+        {
+            tracing::error!(target: "blut::hf_trainer", "stdout reader join failed: {e}");
         }
-        if let Some(h) = stderr_handle {
-            if let Err(e) = h.await {
-                tracing::error!(target: "blut::hf_trainer", "stderr reader join failed: {e}");
-            }
+        if let Some(h) = stderr_handle
+            && let Err(e) = h.await
+        {
+            tracing::error!(target: "blut::hf_trainer", "stderr reader join failed: {e}");
         }
         if let Some(pid) = self.child_pid.lock().take() {
             blut::python_kill::unregister_child(pid);
@@ -360,12 +364,12 @@ fn wrapper_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("BLUT_HF_TRAINER_RUNNER") {
         return Some(PathBuf::from(p));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("python").join("hf_trainer_runner.py");
-            if p.exists() {
-                return Some(p);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let p = dir.join("python").join("hf_trainer_runner.py");
+        if p.exists() {
+            return Some(p);
         }
     }
     // Development tree fallback: walk up to find a Cargo.toml then

@@ -52,5 +52,5 @@ impl Stage for DistillTrain {
             "the trainer_distill.py stub was removed (ADR 0037 Stage 5) — use the blut-lamu distill_bitnet stage (ternary) or hf_sft_train (HF-base) instead"
                 .into(),
         ))
-}
+    }
 }

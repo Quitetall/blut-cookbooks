@@ -51,10 +51,10 @@ fn trainer_script() -> PathBuf {
 
 fn have_python() -> Option<PathBuf> {
     for cand in ["python3", "python"] {
-        if let Ok(out) = std::process::Command::new(cand).arg("--version").output() {
-            if out.status.success() {
-                return Some(PathBuf::from(cand));
-            }
+        if let Ok(out) = std::process::Command::new(cand).arg("--version").output()
+            && out.status.success()
+        {
+            return Some(PathBuf::from(cand));
         }
     }
     None

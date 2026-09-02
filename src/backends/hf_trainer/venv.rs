@@ -94,12 +94,12 @@ pub fn ensure_venv() -> Result<PathBuf, VenvError> {
     let py = python_path(&root);
 
     // Fast path: marker says we're good.
-    if marker.exists() && py.exists() {
-        if let Ok(s) = std::fs::read_to_string(&marker) {
-            if s.trim() == VENV_VERSION {
-                return Ok(py);
-            }
-        }
+    if marker.exists()
+        && py.exists()
+        && let Ok(s) = std::fs::read_to_string(&marker)
+        && s.trim() == VENV_VERSION
+    {
+        return Ok(py);
     }
 
     // Take the lock atomically. `create_new(true)` returns
@@ -203,12 +203,12 @@ fn pid_in_lock_is_dead(_lock: &Path) -> bool {
 fn wait_for_marker(marker: &Path, py: &Path, timeout: Duration) -> Result<(), VenvError> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if marker.exists() && py.exists() {
-            if let Ok(s) = std::fs::read_to_string(marker) {
-                if s.trim() == VENV_VERSION {
-                    return Ok(());
-                }
-            }
+        if marker.exists()
+            && py.exists()
+            && let Ok(s) = std::fs::read_to_string(marker)
+            && s.trim() == VENV_VERSION
+        {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_secs(2));
     }
