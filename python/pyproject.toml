@@ -9,6 +9,7 @@ description = "Shared Python runtime for BLUT cookbooks: run context, metric log
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Brian Lam" }]
 keywords = ["blut", "training", "cookbook", "metrics", "provenance"]
 classifiers = [
@@ -31,4 +32,4 @@ Repository = "https://github.com/Quitetall/blut-cookbooks"
 packages = ["blut_core"]
 
 [tool.hatch.build.targets.sdist]
-include = ["blut_core", "README.md"]
+include = ["blut_core", "README.md", "LICENSE"]

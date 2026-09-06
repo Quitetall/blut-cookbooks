@@ -14,6 +14,7 @@ domain-agnostic building blocks any cookbook can reuse.
 - the ingredient specs and builders the generic training recipes build on
 
 `torch` is imported lazily, inside `checkpoint` and `sysgauge` only, so
-`import blut_core` stays cheap. Install `blut-core[torch]` if you call those.
+`import blut_core` stays cheap. Install `blut-core[torch]` if you call those, and `blut-core[parquet]` for
+Parquet metric logs.
 
 Apache-2.0. Published from the `blut-cookbooks` repository.
