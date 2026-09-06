@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "blut-core"
+version = "0.1.0"
+description = "Shared Python runtime for BLUT cookbooks: run context, metric log, status wire, run manifest, checkpoint contract, ingredient registry."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{ name = "Brian Lam" }]
+keywords = ["blut", "training", "cookbook", "metrics", "provenance"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# torch is lazy-imported inside checkpoint/sysgauge only, so importing
+# blut_core stays cheap; a consumer that uses those functions brings its own
+# torch (pinned by the cookbook, not here).
+dependencies = []
+
+[project.optional-dependencies]
+torch = ["torch>=2.5"]
+parquet = ["pyarrow>=15"]
+
+[project.urls]
+Repository = "https://github.com/Quitetall/blut-cookbooks"
+
+[tool.hatch.build.targets.wheel]
+packages = ["blut_core"]
+
+[tool.hatch.build.targets.sdist]
+include = ["blut_core", "README.md"]
