@@ -218,6 +218,34 @@ mod tests {
         assert_eq!(std::fs::read_dir(&context.stage_dir).unwrap().count(), 1);
     }
 
+    #[tokio::test]
+    async fn failed_publication_preserves_destination_and_removes_temporary_copy() {
+        let td = tempfile::tempdir().unwrap();
+        let context = ctx(td.path());
+        let source = td.path().join("source.jsonl");
+        std::fs::write(&source, "{}\n").unwrap();
+        let destination = context.stage_dir.join("dataset.jsonl");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("existing"), "retained").unwrap();
+        let result = MaterializeDatasetPath
+            .run(
+                &context,
+                (),
+                &Args {
+                    path: Some(source.clone()),
+                    registered_name: None,
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(StageError::Io { .. })));
+        assert_eq!(
+            std::fs::read(destination.join("existing")).unwrap(),
+            b"retained"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"{}\n");
+        assert_eq!(std::fs::read_dir(&context.stage_dir).unwrap().count(), 1);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn output_symlink_does_not_redirect_materialization() {
