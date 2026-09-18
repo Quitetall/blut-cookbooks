@@ -11,7 +11,8 @@
 //! that have a path call this with `path` set. Recipes that ship a
 //! dataset name pre-registered in `datasets_db` call this with
 //! `registered_name` set; the stage resolves the name to its
-//! recorded `source_path` and re-hashes the file.
+//! recorded `source_path`. The selected bytes are copied into stage-owned storage;
+//! count and content hash describe that retained copy, not a mutable source locator.
 
 use std::path::PathBuf;
 
@@ -40,7 +41,8 @@ pub struct Args {
 #[async_trait]
 impl Stage for MaterializeDatasetPath {
     const NAME: &'static str = "materialize_dataset_path";
-    const SCHEMA: u32 = 1;
+    // Invalidate cached locator-only outputs from behavior schema 1.
+    const SCHEMA: u32 = 2;
     const RESOURCES: &'static [Resource] = &[Resource::Disk];
     type Input = ();
     type Output = DatasetJsonl;
@@ -48,7 +50,7 @@ impl Stage for MaterializeDatasetPath {
 
     async fn run(
         &self,
-        _ctx: &StageContext,
+        ctx: &StageContext,
         _input: (),
         args: &Args,
     ) -> Result<DatasetJsonl, StageError> {
@@ -94,15 +96,47 @@ impl Stage for MaterializeDatasetPath {
             )));
         }
 
-        let content_hash =
-            ContentHash::hash_file(&resolved_path).map_err(|source| StageError::Io {
-                path: resolved_path.clone(),
+        // The engine packages backing files from the stage's owned directory.
+        // Returning the caller's locator both fails that ownership check and lets
+        // later source edits change a supposedly materialized artifact.
+        let output_path = ctx.stage_dir.join("dataset.jsonl");
+        let mut input = std::fs::File::open(&resolved_path).map_err(|source| StageError::Io {
+            path: resolved_path.clone(),
+            source,
+        })?;
+        let mut pending =
+            tempfile::NamedTempFile::new_in(&ctx.stage_dir).map_err(|source| StageError::Io {
+                path: ctx.stage_dir.clone(),
                 source,
             })?;
-        let n_examples = count_jsonl_examples(&resolved_path)?;
+        std::io::copy(&mut input, pending.as_file_mut()).map_err(|source| StageError::Io {
+            path: output_path.clone(),
+            source,
+        })?;
+        let content_hash =
+            ContentHash::hash_file(pending.path()).map_err(|source| StageError::Io {
+                path: output_path.clone(),
+                source,
+            })?;
+        let n_examples = count_jsonl_examples(pending.path())?;
+        pending
+            .as_file()
+            .sync_all()
+            .map_err(|source| StageError::Io {
+                path: output_path.clone(),
+                source,
+            })?;
+        // Atomic replacement does not follow an existing destination symlink.
+        // Failed reads/validation leave any previous output intact.
+        pending
+            .persist(&output_path)
+            .map_err(|error| StageError::Io {
+                path: output_path.clone(),
+                source: error.error,
+            })?;
 
         Ok(DatasetJsonl {
-            path: resolved_path,
+            path: output_path,
             content_hash,
             n_examples,
         })
@@ -153,8 +187,63 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(out.path, p);
+        assert_eq!(out.path, td.path().join("stage/dataset.jsonl"));
         assert_eq!(out.n_examples, 3);
+        let original = std::fs::read(&p).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(std::fs::read(&out.path).unwrap(), original);
+        assert_eq!(ContentHash::hash_file(&out.path).unwrap(), out.content_hash);
+    }
+
+    #[tokio::test]
+    async fn unreadable_dataset_preserves_previous_output() {
+        let td = tempfile::tempdir().unwrap();
+        let context = ctx(td.path());
+        let output = context.stage_dir.join("dataset.jsonl");
+        std::fs::write(&output, "previous\n").unwrap();
+        let source = td.path().join("invalid.jsonl");
+        std::fs::write(&source, [0xff, b'\n']).unwrap();
+        let result = MaterializeDatasetPath
+            .run(
+                &context,
+                (),
+                &Args {
+                    path: Some(source),
+                    registered_name: None,
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"previous\n");
+        assert_eq!(std::fs::read_dir(&context.stage_dir).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_symlink_does_not_redirect_materialization() {
+        let td = tempfile::tempdir().unwrap();
+        let context = ctx(td.path());
+        let source = td.path().join("source.jsonl");
+        let outside = td.path().join("untouched.jsonl");
+        std::fs::write(&source, "{}\n").unwrap();
+        std::fs::write(&outside, "outside\n").unwrap();
+        std::os::unix::fs::symlink(&outside, context.stage_dir.join("dataset.jsonl")).unwrap();
+        let output = MaterializeDatasetPath
+            .run(
+                &context,
+                (),
+                &Args {
+                    path: Some(source.clone()),
+                    registered_name: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.path, context.stage_dir.join("dataset.jsonl"));
+        assert!(!output.path.is_symlink());
+        assert_eq!(std::fs::read(&output.path).unwrap(), b"{}\n");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside\n");
+        assert_eq!(std::fs::read(&source).unwrap(), b"{}\n");
     }
 
     #[tokio::test]
