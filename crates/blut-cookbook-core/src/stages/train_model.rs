@@ -17,6 +17,7 @@ use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
 
 use super::shared::IngredientCfg;
+use blut_backends::distributed::{Rendezvous, torchrun_args};
 
 pub struct TrainModel;
 
@@ -167,40 +168,17 @@ impl Stage for TrainModel {
             },
         )?;
 
-        // Invoke the generic trainer (via torchrun when DDP)
+        // Invoke the generic trainer (via torchrun when the run is distributed)
         let nproc = args.nproc_per_node.max(1);
         let nnodes = args.nnodes.max(1);
+        let rdzv = if nnodes > 1 {
+            Some(Rendezvous::from_env().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?)
+        } else {
+            None
+        };
         let mut cmd = std::process::Command::new("python3");
-        if nproc > 1 {
-            // DDP mode: launch via torchrun
-            cmd.args(["-m", "torch.distributed.run"]);
-            if nnodes <= 1 {
-                // Single-node DDP
-                cmd.args(["--standalone", "--nproc_per_node", &nproc.to_string()]);
-            } else {
-                // Multi-node DDP: read rendezvous from env (set by Slurm launcher)
-                let master_addr = std::env::var("MASTER_ADDR").unwrap_or_else(|_| {
-                    tracing::warn!("MASTER_ADDR not set for multi-node DDP, using 127.0.0.1");
-                    "127.0.0.1".into()
-                });
-                let master_port = std::env::var("MASTER_PORT").unwrap_or_else(|_| "29500".into());
-                let node_rank = std::env::var("NODE_RANK").unwrap_or_else(|_| {
-                    tracing::warn!("NODE_RANK not set for multi-node DDP, using 0");
-                    "0".into()
-                });
-                cmd.args([
-                    "--nnodes",
-                    &nnodes.to_string(),
-                    "--nproc_per_node",
-                    &nproc.to_string(),
-                    "--rdzv_backend",
-                    "c10d",
-                    "--rdzv_endpoint",
-                    &format!("{master_addr}:{master_port}"),
-                    "--node_rank",
-                    &node_rank,
-                ]);
-            }
+        if let Some(launch) = torchrun_args(nproc, nnodes, rdzv.as_ref()) {
+            cmd.args(&launch);
         }
         cmd.args([
             "-m",
@@ -210,7 +188,11 @@ impl Stage for TrainModel {
         ]);
         cmd.current_dir(&ctx.stage_dir);
 
-        // For DDP: don't pin to a single device — torchrun manages LOCAL_RANK
+        // Pin only when this node runs a single process. With several local
+        // ranks torchrun assigns devices through LOCAL_RANK and a pin would
+        // collapse every rank onto one card. One rank per node (the usual
+        // multi-node shape) still pins: LOCAL_RANK is 0 there, so device 0
+        // must be the card the scheduler actually granted.
         if nproc <= 1 {
             if let Some(dev) = ctx.device_index {
                 cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());

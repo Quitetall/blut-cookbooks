@@ -39,6 +39,7 @@ pub mod backend;
 pub mod backends;
 pub mod conversations;
 pub mod convert;
+pub mod distributed;
 pub mod stages;
 
 /// Process-wide lock for tests that mutate environment variables.
