@@ -34,6 +34,15 @@ pub struct Args {
     /// Dataset split (default: "train").
     #[serde(default = "default_split")]
     pub split: String,
+    /// HuggingFace dataset config/subset name. Required by datasets that
+    /// publish several configs — `wikitext` has no loadable default, so
+    /// without this the recipe cannot open them at all.
+    #[serde(default)]
+    pub subset: Option<String>,
+    /// Cap the rows loaded. `None` takes the whole split, which for most real
+    /// corpora is far more than a smoke run wants.
+    #[serde(default)]
+    pub max_samples: Option<usize>,
     /// Model ingredient config.
     pub model: IngredientCfg,
     /// Optimizer ingredient config.
@@ -139,16 +148,7 @@ impl Recipe for TrainFromDataset {
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;
 
         let plan = Plan::new(Self::NAME, recipe_args_json)
-            .start(
-                LoadDataset,
-                LoadArgs {
-                    path: args.dataset_path.clone(),
-                    hf_name: args.hf_name.clone(),
-                    split: args.split.clone(),
-                    subset: None,
-                    max_samples: None,
-                },
-            )
+            .start(LoadDataset, load_args(&args))
             .then(
                 SplitTrainEval,
                 SplitArgs {
@@ -178,6 +178,20 @@ impl Recipe for TrainFromDataset {
             )
             .finish();
         Ok(plan)
+    }
+}
+
+/// Map the recipe's arguments onto the `load_dataset` stage.
+///
+/// Named for the same reason as [`train_args`]: a compiled plan does not let a
+/// test outside the engine read a stage's arguments back.
+fn load_args(args: &Args) -> LoadArgs {
+    LoadArgs {
+        path: args.dataset_path.clone(),
+        hf_name: args.hf_name.clone(),
+        split: args.split.clone(),
+        subset: args.subset.clone(),
+        max_samples: args.max_samples,
     }
 }
 
@@ -217,6 +231,8 @@ mod tests {
             hf_name: Some("imdb".into()),
             dataset_path: None,
             split: "train".into(),
+            subset: None,
+            max_samples: None,
             nproc_per_node: 1,
             nnodes: 1,
             parallel_strategy: ParallelStrategy::Ddp,
@@ -303,6 +319,20 @@ mod tests {
         assert_eq!(t.nnodes, 1);
         assert_eq!(t.nproc_per_node, 1);
         assert_eq!(t.parallel_strategy, ParallelStrategy::Ddp);
+    }
+
+    /// `subset` and `max_samples` were hard-coded to `None` alongside the
+    /// distributed fields. A dataset that publishes several configs — wikitext
+    /// among them — has no loadable default, so those were simply unopenable
+    /// from this recipe, and every other corpus loaded in full.
+    #[test]
+    fn the_dataset_selectors_reach_the_load_stage() {
+        let mut a = args();
+        a.subset = Some("wikitext-2-raw-v1".into());
+        a.max_samples = Some(256);
+        let l = load_args(&a);
+        assert_eq!(l.subset.as_deref(), Some("wikitext-2-raw-v1"));
+        assert_eq!(l.max_samples, Some(256));
     }
 
     #[test]
