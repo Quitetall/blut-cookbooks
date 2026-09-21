@@ -18,7 +18,7 @@ use blut_backends::stages::take_train::TakeTrain;
 use crate::stages::IngredientCfg;
 use crate::stages::evaluate_model::{Args as EvalArgs, EvaluateModel};
 use crate::stages::load_dataset::{Args as LoadArgs, LoadDataset};
-use crate::stages::train_model::{Args as TrainArgs, TrainModel};
+use crate::stages::train_model::{Args as TrainArgs, ParallelStrategy, TrainModel};
 
 #[derive(Default)]
 pub struct TrainFromDataset;
@@ -59,10 +59,27 @@ pub struct Args {
     /// Device to train on.
     #[serde(default = "default_device")]
     pub device: String,
+    /// Processes (GPUs) per node. 1 = single process. >1 = local DDP.
+    #[serde(default = "default_nproc")]
+    pub nproc_per_node: u32,
+    /// Nodes in the job. >1 requires MASTER_ADDR and NODE_RANK in the
+    /// environment of every node; the Slurm launcher exports both.
+    #[serde(default = "default_nnodes")]
+    pub nnodes: u32,
+    /// `ddp` (replicate, default) or `fsdp` (FSDP2 shard). Only meaningful
+    /// once the run is distributed.
+    #[serde(default)]
+    pub parallel_strategy: ParallelStrategy,
 }
 
 fn default_split() -> String {
     "train".into()
+}
+fn default_nproc() -> u32 {
+    1
+}
+fn default_nnodes() -> u32 {
+    1
 }
 fn default_step() -> IngredientCfg {
     IngredientCfg {
@@ -143,24 +160,7 @@ impl Recipe for TrainFromDataset {
                 TakeTrain,
                 blut_backends::stages::take_train::Args::default(),
             )
-            .then(
-                TrainModel,
-                TrainArgs {
-                    model: args.model.clone(),
-                    optimizer: args.optimizer.clone(),
-                    scheduler: args.scheduler.clone(),
-                    loss: args.loss.clone(),
-                    step: args.step.clone(),
-                    epochs: args.epochs,
-                    batch_size: args.batch_size,
-                    seed: args.seed,
-                    device: args.device.clone(),
-                    lora_rank: None,
-                    nproc_per_node: 1,
-                    nnodes: 1,
-                    parallel_strategy: Default::default(), // Ddp; single-GPU recipe, moot at nproc=1
-                },
-            )
+            .then(TrainModel, train_args(&args))
             .then(
                 EvaluateModel,
                 EvalArgs {
@@ -181,6 +181,31 @@ impl Recipe for TrainFromDataset {
     }
 }
 
+/// Map the recipe's arguments onto the `train_model` stage.
+///
+/// Named and separate so the mapping is testable: the engine keeps compiled
+/// plan nodes `pub(crate)`, so a test outside the engine cannot read a stage's
+/// arguments back off a plan. The distributed fields in particular were once
+/// hard-coded to `1` here while the stage supported more, which no test could
+/// have caught through `compile` alone.
+fn train_args(args: &Args) -> TrainArgs {
+    TrainArgs {
+        model: args.model.clone(),
+        optimizer: args.optimizer.clone(),
+        scheduler: args.scheduler.clone(),
+        loss: args.loss.clone(),
+        step: args.step.clone(),
+        epochs: args.epochs,
+        batch_size: args.batch_size,
+        seed: args.seed,
+        device: args.device.clone(),
+        lora_rank: None,
+        nproc_per_node: args.nproc_per_node,
+        nnodes: args.nnodes,
+        parallel_strategy: args.parallel_strategy,
+    }
+}
+
 blut::register_recipe!(TrainFromDataset);
 
 #[cfg(test)]
@@ -192,6 +217,9 @@ mod tests {
             hf_name: Some("imdb".into()),
             dataset_path: None,
             split: "train".into(),
+            nproc_per_node: 1,
+            nnodes: 1,
+            parallel_strategy: ParallelStrategy::Ddp,
             model: IngredientCfg {
                 kind: "model".into(),
                 name: "from_pretrained".into(),
@@ -242,6 +270,39 @@ mod tests {
         a.hf_name = None;
         let r = TrainFromDataset.compile(a);
         assert!(matches!(r, Err(RecipeError::InvalidArgs { .. })));
+    }
+
+    /// The recipe used to hard-code `nproc_per_node: 1, nnodes: 1`, so the
+    /// stage's multi-node support was unreachable from every shipped recipe:
+    /// you could rent two machines and have no supported way to ask for them.
+    #[test]
+    fn the_distributed_shape_reaches_the_train_stage() {
+        let mut a = args();
+        a.nnodes = 2;
+        a.nproc_per_node = 4;
+        a.parallel_strategy = ParallelStrategy::Fsdp;
+        let t = train_args(&a);
+        assert_eq!(t.nnodes, 2);
+        assert_eq!(t.nproc_per_node, 4);
+        assert_eq!(t.parallel_strategy, ParallelStrategy::Fsdp);
+        // And the plan still compiles with the distributed shape in it.
+        assert_eq!(
+            TrainFromDataset
+                .compile(a)
+                .unwrap()
+                .into_compiled()
+                .n_nodes(),
+            5
+        );
+    }
+
+    /// Defaults must keep a plain single-GPU run exactly as it was.
+    #[test]
+    fn the_default_shape_is_a_single_local_process() {
+        let t = train_args(&args());
+        assert_eq!(t.nnodes, 1);
+        assert_eq!(t.nproc_per_node, 1);
+        assert_eq!(t.parallel_strategy, ParallelStrategy::Ddp);
     }
 
     #[test]
