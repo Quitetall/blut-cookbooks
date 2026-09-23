@@ -11,20 +11,23 @@
 //! `args.prompts` is empty — keeps recipes that already have an
 //! eval split from needing to duplicate prompt strings.
 //!
-//! Stub-body shape matches the other eval stages: synthetic
-//! per-checkpoint scoring so the recipe DAG round-trips end-to-end
-//! before the real HTTP path lands.
+//! The judge call is not wired yet. Until it is, this stage refuses to run.
+//! It used to return a mean score derived from the checkpoint's content
+//! hash, shaped exactly like a real result and marked only by a
+//! `"synthetic": true` key that nothing downstream read.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use blut::artifacts::{DatasetJsonl, EvalReport, HfCheckpoint};
-use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
 
 pub struct EvalJudge;
+
+/// Why this stage refuses to run. It used to fabricate a result instead.
+const NOT_IMPLEMENTED: &str = "eval_judge is not implemented: the judge-model call is not wired yet. It no longer returns placeholder scores. Use eval_loss for a measured held-out loss and perplexity.";
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Args {
@@ -41,7 +44,8 @@ fn default_n_samples() -> u32 {
 #[async_trait]
 impl Stage for EvalJudge {
     const NAME: &'static str = "eval_judge";
-    const SCHEMA: u32 = 1;
+    // 2: stopped emitting synthetic scores; cached v1 reports are invalid.
+    const SCHEMA: u32 = 2;
     const RESOURCES: &'static [Resource] = &[Resource::Gpu, Resource::Network];
     type Input = (HfCheckpoint, DatasetJsonl);
     type Output = EvalReport;
@@ -49,11 +53,11 @@ impl Stage for EvalJudge {
 
     async fn run(
         &self,
-        ctx: &StageContext,
+        _ctx: &StageContext,
         input: Self::Input,
         args: &Args,
     ) -> Result<EvalReport, StageError> {
-        let (ckpt, ds) = input;
+        let (_ckpt, ds) = input;
         // R23: hard guards (release-mode too). Negative n_examples
         // would wrap on the `as u32` cast below; large n_samples
         // could overflow into negative via `as i64`. Reject both
@@ -78,37 +82,14 @@ impl Stage for EvalJudge {
         // `args.n_samples as i64` is lossless and the min() result
         // is bounded by u32::MAX, so the `as u32` cast below is
         // well-defined.
-        let seed = ckpt.content_hash.0[2] as f32 / 255.0;
-        let n = if args.prompts.is_empty() {
-            (args.n_samples as i64).min(ds.n_examples).max(0) as u32
-        } else {
-            args.prompts.len() as u32
-        };
-        let score = 0.4 + seed * 0.5;
-        let metrics = serde_json::json!({
-            "judge_model": args.judge_model,
-            "n_samples": n,
-            "mean_score": score,
-            "synthetic": true,
-        });
-        let path = ctx.stage_dir.join("eval_judge.json");
-        super::util::write_report(&path, &metrics)?;
-        let content_hash = ContentHash::hash_file(&path).map_err(|source| StageError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        Ok(EvalReport {
-            path,
-            evaluator: "eval_judge".into(),
-            metrics,
-            content_hash,
-        })
+        Err(StageError::BadInput(NOT_IMPLEMENTED.into()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blut::framework::artifact::ContentHash;
     use std::path::PathBuf;
 
     fn ckpt() -> HfCheckpoint {
@@ -133,22 +114,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn produces_mean_score() {
+    async fn refuses_rather_than_inventing_scores() {
         let td = tempfile::tempdir().unwrap();
         let r = EvalJudge
             .run(
                 &ctx(td.path()),
                 (ckpt(), ds(100)),
                 &Args {
-                    judge_model: "claude-opus-4-7".into(),
+                    judge_model: "a-judge".into(),
                     prompts: vec![],
                     n_samples: 10,
                 },
             )
-            .await
-            .unwrap();
-        assert!(r.metrics["mean_score"].is_number());
-        assert_eq!(r.metrics["n_samples"], serde_json::json!(10));
+            .await;
+        assert!(
+            matches!(&r, Err(StageError::BadInput(m)) if m.contains("not implemented")),
+            "got {r:?}"
+        );
     }
 
     #[tokio::test]

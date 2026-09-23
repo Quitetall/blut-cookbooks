@@ -21,6 +21,7 @@ use blut_backends::stages::{
     split_train_eval::{Args as SplitArgs, SplitTrainEval},
 };
 
+use crate::recipes::shared::{DatasetSelect, TrainShape};
 use crate::stages::IngredientCfg;
 use crate::stages::load_dataset::{Args as LoadArgs, LoadDataset};
 use crate::stages::train_model::{Args as TrainArgs, TrainModel};
@@ -39,6 +40,9 @@ pub struct Args {
     /// Dataset split (default: "train").
     #[serde(default = "default_split")]
     pub split: String,
+    /// `subset` and `max_samples`.
+    #[serde(flatten)]
+    pub dataset: DatasetSelect,
     /// Model ingredient config (should be lora_adapter for LoRA fine-tuning).
     pub model: IngredientCfg,
     /// Optimizer ingredient config.
@@ -72,6 +76,10 @@ pub struct Args {
     /// Notes for model registry.
     #[serde(default)]
     pub notes: String,
+    /// `nproc_per_node`, `nnodes`, `parallel_strategy`, `text_field`,
+    /// `max_seq_len`.
+    #[serde(flatten)]
+    pub shape: TrainShape,
 }
 
 fn default_split() -> String {
@@ -143,16 +151,7 @@ impl Recipe for FinetunePretrained {
             .map_err(|e| RecipeError::CompileFailed(format!("serialize args: {e}")))?;
 
         let plan = Plan::new(Self::NAME, recipe_args_json)
-            .start(
-                LoadDataset,
-                LoadArgs {
-                    path: args.dataset_path.clone(),
-                    hf_name: args.hf_name.clone(),
-                    split: args.split.clone(),
-                    subset: None,
-                    max_samples: None,
-                },
-            )
+            .start(LoadDataset, load_args(&args))
             .then(
                 SplitTrainEval,
                 SplitArgs {
@@ -164,24 +163,7 @@ impl Recipe for FinetunePretrained {
                 TakeTrain,
                 blut_backends::stages::take_train::Args::default(),
             )
-            .then(
-                TrainModel,
-                TrainArgs {
-                    model: args.model.clone(),
-                    optimizer: args.optimizer.clone(),
-                    scheduler: args.scheduler.clone(),
-                    loss: args.loss.clone(),
-                    step: args.step.clone(),
-                    epochs: args.epochs,
-                    batch_size: args.batch_size,
-                    seed: args.seed,
-                    device: args.device.clone(),
-                    lora_rank: None,
-                    nproc_per_node: 1,
-                    nnodes: 1,
-                    parallel_strategy: Default::default(), // Ddp; single-GPU recipe, moot at nproc=1
-                },
-            )
+            .then(TrainModel, train_args(&args))
             .then(MergeLora, MergeArgs::default())
             .then(
                 ConvertGguf,
@@ -200,6 +182,39 @@ impl Recipe for FinetunePretrained {
             )
             .finish();
         Ok(plan)
+    }
+}
+
+/// Map the recipe's arguments onto the `load_dataset` stage. Named so the
+/// mapping can be tested: a compiled plan does not expose stage arguments.
+fn load_args(args: &Args) -> LoadArgs {
+    LoadArgs {
+        path: args.dataset_path.clone(),
+        hf_name: args.hf_name.clone(),
+        split: args.split.clone(),
+        subset: args.dataset.subset.clone(),
+        max_samples: args.dataset.max_samples,
+    }
+}
+
+/// Map the recipe's arguments onto the `train_model` stage.
+fn train_args(args: &Args) -> TrainArgs {
+    TrainArgs {
+        model: args.model.clone(),
+        optimizer: args.optimizer.clone(),
+        scheduler: args.scheduler.clone(),
+        loss: args.loss.clone(),
+        step: args.step.clone(),
+        epochs: args.epochs,
+        batch_size: args.batch_size,
+        seed: args.seed,
+        device: args.device.clone(),
+        lora_rank: None,
+        nproc_per_node: args.shape.nproc_per_node,
+        nnodes: args.shape.nnodes,
+        parallel_strategy: args.shape.parallel_strategy,
+        text_field: args.shape.text_field.clone(),
+        max_seq_len: args.shape.max_seq_len,
     }
 }
 
@@ -243,6 +258,8 @@ mod tests {
             output_name: "my-finetuned-model".into(),
             quant: "Q4_K_M".into(),
             notes: String::new(),
+            dataset: DatasetSelect::default(),
+            shape: TrainShape::default(),
         }
     }
 
@@ -251,6 +268,35 @@ mod tests {
         let plan = FinetunePretrained.compile(args()).unwrap().into_compiled();
         assert_eq!(plan.n_nodes(), 7);
         assert_eq!(plan.n_edges(), 6);
+    }
+
+    /// This recipe hard-coded the same `subset`/`max_samples` = `None` and
+    /// one-process layout that `train_from_dataset` did.
+    #[test]
+    fn dataset_and_shape_reach_their_stages() {
+        let mut a = args();
+        a.dataset.subset = Some("wikitext-2-raw-v1".into());
+        a.dataset.max_samples = Some(64);
+        a.shape.nnodes = 2;
+        a.shape.nproc_per_node = 2;
+        assert_eq!(load_args(&a).subset.as_deref(), Some("wikitext-2-raw-v1"));
+        assert_eq!(load_args(&a).max_samples, Some(64));
+        let t = train_args(&a);
+        assert_eq!((t.nproc_per_node, t.nnodes), (2, 2));
+    }
+
+    #[test]
+    fn defaulted_shared_fields_leave_the_plan_identity_unchanged() {
+        let json = serde_json::to_value(args()).unwrap();
+        for key in [
+            "subset",
+            "max_samples",
+            "nproc_per_node",
+            "nnodes",
+            "parallel_strategy",
+        ] {
+            assert!(json.get(key).is_none(), "{key} serialized at its default");
+        }
     }
 
     #[test]

@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use blut::artifacts::{DatasetJsonl, EvalReport, HfCheckpoint};
-use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
@@ -15,6 +14,13 @@ use super::shared::IngredientCfg;
 
 pub struct EvaluateModel;
 pub struct EvaluateLoadedDataset;
+/// Evaluate a checkpoint on held-out rows that arrive as a plan edge.
+///
+/// The merge end of a `split -> fork(train, take_eval) -> merge` recipe.
+/// `evaluate_model` fetches its own rows from a dataset name, and the recipe
+/// that used it passed the TRAINING split's name — so its report measured
+/// the model on the data it had just trained on.
+pub struct EvaluateHeldOut;
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Args {
@@ -27,12 +33,25 @@ pub struct Args {
     /// HuggingFace split used when `hf_name` is selected.
     #[serde(default = "default_split")]
     pub split: String,
+    /// HuggingFace dataset config/subset name, for datasets that publish
+    /// several (`wikitext` has no loadable default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subset: Option<String>,
+    /// Cap the rows loaded. Unset takes the whole split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_samples: Option<usize>,
     /// Evaluation ingredient.
     pub eval: IngredientCfg,
     #[serde(default = "default_batch_size")]
     pub batch_size: u32,
     #[serde(default = "default_device")]
     pub device: String,
+    /// Causal-LM packing, as for training (evaluator default `"text"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_field: Option<String>,
+    /// Causal-LM packing, as for training (evaluator default 512).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seq_len: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -43,6 +62,31 @@ pub struct LoadedDatasetArgs {
     pub batch_size: u32,
     #[serde(default = "default_device")]
     pub device: String,
+    /// Causal-LM packing, as for training (evaluator default `"text"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_field: Option<String>,
+    /// Causal-LM packing, as for training (evaluator default 512).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seq_len: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HeldOutArgs {
+    /// Evaluation ingredient.
+    pub eval: IngredientCfg,
+    /// The loss ingredient training used; `loss_eval` scores with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss: Option<IngredientCfg>,
+    #[serde(default = "default_batch_size")]
+    pub batch_size: u32,
+    #[serde(default = "default_device")]
+    pub device: String,
+    /// Causal-LM packing, as for training (evaluator default `"text"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_field: Option<String>,
+    /// Causal-LM packing, as for training (evaluator default 512).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seq_len: Option<u32>,
 }
 
 fn default_split() -> String {
@@ -76,17 +120,22 @@ fn resolve_dataset(ctx: &StageContext, args: &Args) -> Result<PathBuf, StageErro
         }
         (None, Some(name)) => {
             let output = ctx.stage_dir.join("evaluation_dataset.jsonl");
-            let status = std::process::Command::new("python3")
-                .args(["-m", "blut_core.load_dataset", "--name", name, "--split"])
+            let mut cmd = std::process::Command::new("python3");
+            cmd.args(["-m", "blut_core.load_dataset", "--name", name, "--split"])
                 .arg(&args.split)
                 .arg("--output")
-                .arg(&output)
-                .status()
-                .map_err(|error| {
-                    StageError::Backend(anyhow::anyhow!(
-                        "failed to run blut_core.load_dataset: {error}"
-                    ))
-                })?;
+                .arg(&output);
+            if let Some(subset) = &args.subset {
+                cmd.args(["--subset", subset]);
+            }
+            if let Some(max) = args.max_samples {
+                cmd.arg("--max-samples").arg(max.to_string());
+            }
+            let status = cmd.status().map_err(|error| {
+                StageError::Backend(anyhow::anyhow!(
+                    "failed to run blut_core.load_dataset: {error}"
+                ))
+            })?;
             if !status.success() {
                 return Err(StageError::Backend(anyhow::anyhow!(
                     "blut_core.load_dataset exited with {status}"
@@ -103,78 +152,38 @@ fn resolve_dataset(ctx: &StageContext, args: &Args) -> Result<PathBuf, StageErro
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_evaluator(
     ctx: &StageContext,
     checkpoint_path: &Path,
     dataset_path: &Path,
     eval: &IngredientCfg,
+    loss: Option<&IngredientCfg>,
     batch_size: u32,
     device: &str,
+    text_field: Option<&str>,
+    max_seq_len: Option<u32>,
 ) -> Result<EvalReport, StageError> {
-    if !checkpoint_path.exists() {
-        return Err(StageError::BadInput(format!(
-            "checkpoint not found: {}",
-            checkpoint_path.display()
-        )));
-    }
-    if !dataset_path.is_file() {
-        return Err(StageError::BadInput(format!(
-            "dataset not found: {}",
-            dataset_path.display()
-        )));
-    }
-
-    let config = serde_json::json!({
-        "checkpoint_path": checkpoint_path,
-        "dataset_path": dataset_path,
-        "eval": eval,
-        "batch_size": batch_size,
-        "device": device,
-    });
-    let config_path = ctx.stage_dir.join("eval_config.json");
-    let config_json = serde_json::to_string_pretty(&config)
-        .map_err(|error| StageError::Backend(anyhow::anyhow!("serialize eval config: {error}")))?;
-    std::fs::write(&config_path, config_json).map_err(|source| StageError::Io {
-        path: config_path.clone(),
-        source,
-    })?;
-
-    let output_path = ctx.stage_dir.join("eval_report.json");
-    let status = std::process::Command::new("python3")
-        .args(["-m", "blut_core.evaluator", "--config"])
-        .arg(&config_path)
-        .arg("--output")
-        .arg(&output_path)
-        .current_dir(&ctx.stage_dir)
-        .status()
-        .map_err(|error| {
-            StageError::Backend(anyhow::anyhow!(
-                "failed to run blut_core.evaluator: {error}"
-            ))
-        })?;
-    if !status.success() {
-        return Err(StageError::Backend(anyhow::anyhow!(
-            "blut_core.evaluator exited with {status}"
-        )));
-    }
-
-    let report_json = std::fs::read_to_string(&output_path).map_err(|source| StageError::Io {
-        path: output_path.clone(),
-        source,
-    })?;
-    let metrics = serde_json::from_str(&report_json).map_err(|error| {
-        StageError::Backend(anyhow::anyhow!("failed to parse eval report: {error}"))
-    })?;
-    let content_hash = ContentHash::hash_file(&output_path).map_err(|source| StageError::Io {
-        path: output_path.clone(),
-        source,
-    })?;
-    Ok(EvalReport {
-        path: output_path,
-        evaluator: "blut_core.evaluator".into(),
-        metrics,
-        content_hash,
-    })
+    let to_json = |cfg: &IngredientCfg| {
+        serde_json::to_value(cfg)
+            .map_err(|error| StageError::Backend(anyhow::anyhow!("serialize ingredient: {error}")))
+    };
+    let eval = to_json(eval)?;
+    let loss = loss.map(to_json).transpose()?;
+    blut_backends::evaluator::run_evaluator(
+        ctx,
+        &blut_backends::evaluator::EvalRequest {
+            checkpoint_path,
+            dataset_path,
+            eval,
+            loss,
+            batch_size,
+            device,
+            text_field,
+            max_seq_len,
+        },
+        "blut_core.evaluator",
+    )
 }
 
 #[async_trait]
@@ -198,8 +207,11 @@ impl Stage for EvaluateModel {
             &input.path,
             &dataset_path,
             &args.eval,
+            None,
             args.batch_size,
             &args.device,
+            args.text_field.as_deref(),
+            args.max_seq_len,
         )
     }
 }
@@ -224,8 +236,47 @@ impl Stage for EvaluateLoadedDataset {
             &args.checkpoint_path,
             &input.path,
             &args.eval,
+            None,
             args.batch_size,
             &args.device,
+            args.text_field.as_deref(),
+            args.max_seq_len,
+        )
+    }
+}
+
+#[async_trait]
+impl Stage for EvaluateHeldOut {
+    const NAME: &'static str = "evaluate_held_out";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+    type Input = (HfCheckpoint, DatasetJsonl);
+    type Output = EvalReport;
+    type Args = HeldOutArgs;
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: (HfCheckpoint, DatasetJsonl),
+        args: &HeldOutArgs,
+    ) -> Result<EvalReport, StageError> {
+        let (checkpoint, held_out) = input;
+        if held_out.n_examples <= 0 {
+            return Err(StageError::BadInput(format!(
+                "evaluate_held_out: held-out split has {} examples",
+                held_out.n_examples
+            )));
+        }
+        run_evaluator(
+            ctx,
+            &checkpoint.path,
+            &held_out.path,
+            &args.eval,
+            args.loss.as_ref(),
+            args.batch_size,
+            &args.device,
+            args.text_field.as_deref(),
+            args.max_seq_len,
         )
     }
 }
@@ -262,6 +313,10 @@ mod tests {
             },
             batch_size: 1,
             device: "cpu".into(),
+            subset: None,
+            max_samples: None,
+            text_field: None,
+            max_seq_len: None,
         };
         assert_eq!(resolve_dataset(&ctx, &args).unwrap(), path);
     }

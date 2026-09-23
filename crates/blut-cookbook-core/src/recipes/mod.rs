@@ -2,6 +2,7 @@
 
 pub mod eval_only;
 pub mod finetune_pretrained;
+pub mod shared;
 pub mod train_from_dataset;
 
 use blut::recipes::recipe::RecipeDef;

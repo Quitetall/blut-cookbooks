@@ -2,7 +2,8 @@
 //!
 //! Generic training pipeline:
 //!
-//!   load_dataset → split_train_eval → take_train → train_model → evaluate_model
+//!   load_dataset → split_train_eval ─┬→ train_model_on_split ─┬→ evaluate_held_out
+//!                                    └→ take_eval ────────────┘
 //!
 //! Works with any dataset (HuggingFace or local CSV/JSONL) and any model
 //! (via the ingredient system). Zero domain code required.
@@ -13,12 +14,13 @@ use blut::framework::error::RecipeError;
 use blut::framework::plan::Plan;
 use blut::recipes::recipe::Recipe;
 use blut_backends::stages::split_train_eval::{Args as SplitArgs, SplitTrainEval};
-use blut_backends::stages::take_train::TakeTrain;
+use blut_backends::stages::take_eval::TakeEval;
 
+use crate::recipes::shared::{DatasetSelect, TrainShape};
 use crate::stages::IngredientCfg;
-use crate::stages::evaluate_model::{Args as EvalArgs, EvaluateModel};
+use crate::stages::evaluate_model::{EvaluateHeldOut, HeldOutArgs};
 use crate::stages::load_dataset::{Args as LoadArgs, LoadDataset};
-use crate::stages::train_model::{Args as TrainArgs, ParallelStrategy, TrainModel};
+use crate::stages::train_model::{Args as TrainArgs, TrainModelOnSplit};
 
 #[derive(Default)]
 pub struct TrainFromDataset;
@@ -34,15 +36,9 @@ pub struct Args {
     /// Dataset split (default: "train").
     #[serde(default = "default_split")]
     pub split: String,
-    /// HuggingFace dataset config/subset name. Required by datasets that
-    /// publish several configs — `wikitext` has no loadable default, so
-    /// without this the recipe cannot open them at all.
-    #[serde(default)]
-    pub subset: Option<String>,
-    /// Cap the rows loaded. `None` takes the whole split, which for most real
-    /// corpora is far more than a smoke run wants.
-    #[serde(default)]
-    pub max_samples: Option<usize>,
+    /// `subset` and `max_samples`.
+    #[serde(flatten)]
+    pub dataset: DatasetSelect,
     /// Model ingredient config.
     pub model: IngredientCfg,
     /// Optimizer ingredient config.
@@ -68,28 +64,16 @@ pub struct Args {
     /// Device to train on.
     #[serde(default = "default_device")]
     pub device: String,
-    /// Processes (GPUs) per node. 1 = single process. >1 = local DDP.
-    #[serde(default = "default_nproc")]
-    pub nproc_per_node: u32,
-    /// Nodes in the job. >1 requires MASTER_ADDR and NODE_RANK in the
-    /// environment of every node; the Slurm launcher exports both.
-    #[serde(default = "default_nnodes")]
-    pub nnodes: u32,
-    /// `ddp` (replicate, default) or `fsdp` (FSDP2 shard). Only meaningful
-    /// once the run is distributed.
-    #[serde(default)]
-    pub parallel_strategy: ParallelStrategy,
+    /// `nproc_per_node`, `nnodes`, `parallel_strategy`, `text_field`,
+    /// `max_seq_len`.
+    #[serde(flatten)]
+    pub shape: TrainShape,
 }
 
 fn default_split() -> String {
     "train".into()
 }
-fn default_nproc() -> u32 {
-    1
-}
-fn default_nnodes() -> u32 {
-    1
-}
+
 fn default_step() -> IngredientCfg {
     IngredientCfg {
         kind: "step".into(),
@@ -156,26 +140,19 @@ impl Recipe for TrainFromDataset {
                     seed: args.seed,
                 },
             )
-            .then(
-                TakeTrain,
-                blut_backends::stages::take_train::Args::default(),
+            // Train on one half, hold the other out, and evaluate the trained
+            // checkpoint on the half it never saw. This recipe used to chain
+            // `take_train -> train_model -> evaluate_model`, which dropped the
+            // held-out half and had `evaluate_model` reload the dataset by
+            // name — the training split — so the report scored the model on
+            // its own training data.
+            .fork(
+                TrainModelOnSplit,
+                train_args(&args),
+                TakeEval,
+                blut_backends::stages::take_eval::Args::default(),
             )
-            .then(TrainModel, train_args(&args))
-            .then(
-                EvaluateModel,
-                EvalArgs {
-                    dataset_path: args.dataset_path.clone(),
-                    hf_name: args.hf_name.clone(),
-                    split: args.split.clone(),
-                    eval: IngredientCfg {
-                        kind: "eval".into(),
-                        name: "loss_eval".into(),
-                        config: serde_json::Value::Object(Default::default()),
-                    },
-                    batch_size: args.batch_size * 2,
-                    device: args.device.clone(),
-                },
-            )
+            .merge(EvaluateHeldOut, held_out_args(&args))
             .finish();
         Ok(plan)
     }
@@ -190,8 +167,26 @@ fn load_args(args: &Args) -> LoadArgs {
         path: args.dataset_path.clone(),
         hf_name: args.hf_name.clone(),
         split: args.split.clone(),
-        subset: args.subset.clone(),
-        max_samples: args.max_samples,
+        subset: args.dataset.subset.clone(),
+        max_samples: args.dataset.max_samples,
+    }
+}
+
+/// Map the recipe's arguments onto the held-out evaluation. It scores with the
+/// same loss ingredient and the same text packing that training used, so the
+/// held-out number is comparable to the training loss.
+fn held_out_args(args: &Args) -> HeldOutArgs {
+    HeldOutArgs {
+        eval: IngredientCfg {
+            kind: "eval".into(),
+            name: "loss_eval".into(),
+            config: serde_json::Value::Object(Default::default()),
+        },
+        loss: Some(args.loss.clone()),
+        batch_size: args.batch_size.saturating_mul(2),
+        device: args.device.clone(),
+        text_field: args.shape.text_field.clone(),
+        max_seq_len: args.shape.max_seq_len,
     }
 }
 
@@ -214,9 +209,11 @@ fn train_args(args: &Args) -> TrainArgs {
         seed: args.seed,
         device: args.device.clone(),
         lora_rank: None,
-        nproc_per_node: args.nproc_per_node,
-        nnodes: args.nnodes,
-        parallel_strategy: args.parallel_strategy,
+        nproc_per_node: args.shape.nproc_per_node,
+        nnodes: args.shape.nnodes,
+        parallel_strategy: args.shape.parallel_strategy,
+        text_field: args.shape.text_field.clone(),
+        max_seq_len: args.shape.max_seq_len,
     }
 }
 
@@ -225,17 +222,15 @@ blut::register_recipe!(TrainFromDataset);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stages::train_model::ParallelStrategy;
 
     fn args() -> Args {
         Args {
             hf_name: Some("imdb".into()),
             dataset_path: None,
             split: "train".into(),
-            subset: None,
-            max_samples: None,
-            nproc_per_node: 1,
-            nnodes: 1,
-            parallel_strategy: ParallelStrategy::Ddp,
+            dataset: DatasetSelect::default(),
+            shape: TrainShape::default(),
             model: IngredientCfg {
                 kind: "model".into(),
                 name: "from_pretrained".into(),
@@ -267,9 +262,26 @@ mod tests {
 
     #[test]
     fn compiles_to_5_node_plan() {
+        // load -> split -> {train_model_on_split, take_eval} -> evaluate_held_out
         let plan = TrainFromDataset.compile(args()).unwrap().into_compiled();
         assert_eq!(plan.n_nodes(), 5);
-        assert_eq!(plan.n_edges(), 4);
+        assert_eq!(
+            plan.n_edges(),
+            5,
+            "the split fans out to two edges that rejoin"
+        );
+    }
+
+    /// Evaluation must use the loss training used, not a default.
+    #[test]
+    fn held_out_evaluation_scores_with_the_training_loss() {
+        let a = args();
+        let h = held_out_args(&a);
+        assert_eq!(
+            h.loss.as_ref().map(|l| l.name.as_str()),
+            Some(a.loss.name.as_str())
+        );
+        assert_eq!(h.eval.name, "loss_eval");
     }
 
     #[test]
@@ -294,10 +306,16 @@ mod tests {
     #[test]
     fn the_distributed_shape_reaches_the_train_stage() {
         let mut a = args();
-        a.nnodes = 2;
-        a.nproc_per_node = 4;
-        a.parallel_strategy = ParallelStrategy::Fsdp;
+        a.shape = TrainShape {
+            nproc_per_node: 4,
+            nnodes: 2,
+            parallel_strategy: ParallelStrategy::Fsdp,
+            text_field: Some("body".into()),
+            max_seq_len: Some(1024),
+        };
         let t = train_args(&a);
+        assert_eq!(t.text_field.as_deref(), Some("body"));
+        assert_eq!(t.max_seq_len, Some(1024));
         assert_eq!(t.nnodes, 2);
         assert_eq!(t.nproc_per_node, 4);
         assert_eq!(t.parallel_strategy, ParallelStrategy::Fsdp);
@@ -328,11 +346,45 @@ mod tests {
     #[test]
     fn the_dataset_selectors_reach_the_load_stage() {
         let mut a = args();
-        a.subset = Some("wikitext-2-raw-v1".into());
-        a.max_samples = Some(256);
+        a.dataset = DatasetSelect {
+            subset: Some("wikitext-2-raw-v1".into()),
+            max_samples: Some(256),
+        };
         let l = load_args(&a);
         assert_eq!(l.subset.as_deref(), Some("wikitext-2-raw-v1"));
         assert_eq!(l.max_samples, Some(256));
+    }
+
+    /// The recipe's arguments are serialized into the plan's identity. A run
+    /// that sets none of the fields added for distributed or causal-LM
+    /// training must serialize exactly as it did before they existed, or every
+    /// such run misses the cache on arguments that change nothing.
+    #[test]
+    fn defaulted_new_fields_leave_the_plan_identity_unchanged() {
+        let json = serde_json::to_value(args()).unwrap();
+        for key in [
+            "nproc_per_node",
+            "nnodes",
+            "parallel_strategy",
+            "text_field",
+            "max_seq_len",
+            "subset",
+            "max_samples",
+        ] {
+            assert!(json.get(key).is_none(), "{key} serialized at its default");
+        }
+    }
+
+    /// The shared structs are flattened: users still write every field at the
+    /// top level of the recipe's arguments.
+    #[test]
+    fn distributed_and_dataset_fields_are_read_from_the_top_level() {
+        let mut json = serde_json::to_value(args()).unwrap();
+        json["nnodes"] = 2.into();
+        json["subset"] = "wikitext-2-raw-v1".into();
+        let a: Args = serde_json::from_value(json).unwrap();
+        assert_eq!(a.shape.nnodes, 2);
+        assert_eq!(a.dataset.subset.as_deref(), Some("wikitext-2-raw-v1"));
     }
 
     #[test]

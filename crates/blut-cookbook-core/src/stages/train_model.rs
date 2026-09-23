@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use blut::artifacts::{DatasetJsonl, HfCheckpoint};
+use blut::artifacts::{DatasetJsonl, DatasetSplit, HfCheckpoint};
 use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
@@ -45,9 +45,20 @@ pub struct Args {
     /// Device to train on.
     #[serde(default = "default_device")]
     pub device: String,
-    /// Optional LoRA rank (if using lora_adapter model ingredient).
+    /// Not read by the trainer: LoRA rank is set in the `lora_adapter` model
+    /// ingredient's own config. Kept so existing arguments still deserialize
+    /// and cache keys do not move; setting it is rejected rather than
+    /// silently ignored.
     #[serde(default)]
     pub lora_rank: Option<u32>,
+    /// Causal-LM training: the dataset column holding the text. The trainer
+    /// reads `"text"` when unset. Only consulted for a HuggingFace model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_field: Option<String>,
+    /// Causal-LM training: tokens per packed training block. The trainer uses
+    /// 512 when unset. Only consulted for a HuggingFace model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seq_len: Option<u32>,
     /// Number of GPUs for DDP. 1 = single-GPU (default). >1 = torchrun DDP.
     #[serde(default = "default_nproc")]
     pub nproc_per_node: u32,
@@ -72,6 +83,13 @@ pub enum ParallelStrategy {
     #[default]
     Ddp,
     Fsdp,
+}
+
+impl ParallelStrategy {
+    /// Serde `skip_serializing_if` for the default strategy.
+    pub fn is_ddp(&self) -> bool {
+        *self == ParallelStrategy::Ddp
+    }
 }
 
 fn default_nproc() -> u32 {
@@ -131,6 +149,13 @@ impl Stage for TrainModel {
         if args.batch_size == 0 {
             return Err(StageError::BadInput("batch_size must be > 0".into()));
         }
+        if args.lora_rank.is_some() {
+            return Err(StageError::BadInput(
+                "lora_rank is not read by the trainer; set the rank in the \
+                 lora_adapter model ingredient's config instead"
+                    .into(),
+            ));
+        }
         if !input.path.exists() {
             return Err(StageError::BadInput(format!(
                 "dataset not found: {}",
@@ -159,6 +184,8 @@ impl Stage for TrainModel {
             "device": args.device,
             "lora_rank": args.lora_rank,
             "parallel_strategy": args.parallel_strategy,
+            "text_field": args.text_field,
+            "max_seq_len": args.max_seq_len,
         });
         let config_path = ctx.stage_dir.join("train_config.json");
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).map_err(
@@ -235,9 +262,83 @@ impl Stage for TrainModel {
     }
 }
 
+/// `train_model` over the train half of a `DatasetSplit`.
+///
+/// Exists so a recipe can fork a split into this training edge and a
+/// `take_eval` edge, then merge the checkpoint with the held-out rows. The
+/// linear alternative — `take_train` then `train_model` — drops the eval half
+/// on the floor, which left `train_from_dataset` with nothing held out to
+/// evaluate on and let it quietly evaluate on its own training split instead.
+pub struct TrainModelOnSplit;
+
+#[async_trait]
+impl Stage for TrainModelOnSplit {
+    const NAME: &'static str = "train_model_on_split";
+    const SCHEMA: u32 = 1;
+    const RESOURCES: &'static [Resource] = &[Resource::Gpu];
+    const DETERMINISTIC: bool = false;
+    type Input = DatasetSplit;
+    type Output = HfCheckpoint;
+    type Args = Args;
+
+    fn gpu_permits(&self, args: &Args) -> u32 {
+        TrainModel.gpu_permits(args)
+    }
+
+    fn memory_gib_for(&self, args: &Args) -> u32 {
+        TrainModel.memory_gib_for(args)
+    }
+
+    async fn run(
+        &self,
+        ctx: &StageContext,
+        input: DatasetSplit,
+        args: &Args,
+    ) -> Result<HfCheckpoint, StageError> {
+        if input.train.n_examples <= 0 {
+            return Err(StageError::BadInput(format!(
+                "train_model_on_split: train half has {} examples",
+                input.train.n_examples
+            )));
+        }
+        TrainModel.run(ctx, input.train, args).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `lora_rank` used to be accepted and then ignored: the trainer never
+    /// read it. A knob that silently does nothing must be refused, and before
+    /// any Python is spawned.
+    #[tokio::test]
+    async fn lora_rank_is_refused_not_ignored() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(td.path().join("stage")).unwrap();
+        let ctx = StageContext::for_test(td.path().to_path_buf(), td.path().join("stage"));
+        let data = td.path().join("train.jsonl");
+        std::fs::write(&data, r#"{"text":"hi"}"#).unwrap();
+        let input = DatasetJsonl {
+            path: data,
+            content_hash: ContentHash::of_bytes(b"x"),
+            n_examples: 1,
+        };
+        let mut args: Args = serde_json::from_value(serde_json::json!({
+            "model": {"kind": "model", "name": "from_pretrained", "config": {}},
+            "optimizer": {"kind": "optimizer", "name": "adamw", "config": {}},
+            "scheduler": {"kind": "scheduler", "name": "constant", "config": {}},
+            "loss": {"kind": "loss", "name": "causal_lm", "config": {}},
+            "epochs": 1,
+        }))
+        .unwrap();
+        args.lora_rank = Some(16);
+        let r = TrainModel.run(&ctx, input, &args).await;
+        assert!(
+            matches!(&r, Err(StageError::BadInput(m)) if m.contains("lora_adapter")),
+            "got {r:?}"
+        );
+    }
 
     #[test]
     fn args_schema_is_valid() {

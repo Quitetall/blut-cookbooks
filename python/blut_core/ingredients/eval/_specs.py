@@ -14,6 +14,13 @@ from blut_core.spec import IngredientSpec
 
 
 # ---- Loss eval ----------------------------------------------------------
+def _to_device(batch, device):
+    """Move a tensor, or the tensors in a dict batch, to `device`."""
+    if isinstance(batch, dict):
+        return {k: v.to(device) if hasattr(v, "to") else v for k, v in batch.items()}
+    return batch.to(device) if hasattr(batch, "to") else batch
+
+
 @dataclass(frozen=True)
 class LossEvalConfig:
     reduction: str = "mean"
@@ -23,23 +30,38 @@ def _build_loss_eval(cfg: LossEvalConfig):
     """Return an evaluator that computes loss on a dataset."""
     import torch
 
-    def evaluate(model, dataloader, loss_fn, device="cpu"):
+    from blut_core.ingredients.step._specs import _forward
+
+    def evaluate(model, dataloader, device="cpu", loss_fn=None, **kwargs):
+        """Mean per-batch loss.
+
+        Scores with `loss_fn` — the evaluator passes the loss training used.
+        Without one, a model that computes its own loss (a HuggingFace model
+        given `labels`) is scored by that. `loss_fn` used to be a required
+        positional argument the evaluator never supplied, so this ingredient
+        had never run.
+        """
         model.eval()
-        total_loss = 0.0
+        total = None
         n_batches = 0
         with torch.no_grad():
             for batch in dataloader:
-                if isinstance(batch, dict):
-                    batch = {k: v.to(device) if hasattr(v, 'to') else v
-                             for k, v in batch.items()}
+                batch = _to_device(batch, device)
+                output = _forward(model, batch)
+                if loss_fn is not None:
+                    loss = loss_fn(output, batch)
+                elif getattr(output, "loss", None) is not None:
+                    loss = output.loss
                 else:
-                    batch = batch.to(device) if hasattr(batch, 'to') else batch
-                output = model(batch)
-                loss = loss_fn(output, batch) if callable(loss_fn) else loss_fn
-                total_loss += loss.item()
+                    raise ValueError(
+                        "loss_eval needs a loss: pass the training loss "
+                        "ingredient, or use a model that returns its own")
+                loss = loss.detach()
+                total = loss if total is None else total + loss
                 n_batches += 1
-        avg_loss = total_loss / max(n_batches, 1)
-        return {"loss": avg_loss}
+        if n_batches == 0:
+            raise ValueError("loss_eval: the dataset yielded no batches")
+        return {"loss": total.item() / n_batches}
 
     return evaluate
 
@@ -64,8 +86,11 @@ def _build_accuracy(cfg: AccuracyConfig):
     """Return an evaluator that computes top-K accuracy."""
     import torch
 
-    def evaluate(model, dataloader, device="cpu"):
+    from blut_core.lm_data import is_causal_lm
+
+    def evaluate(model, dataloader, device="cpu", **kwargs):
         model.eval()
+        causal = is_causal_lm(model)
         correct = {k: 0 for k in cfg.top_k}
         total = 0
         with torch.no_grad():
@@ -81,9 +106,20 @@ def _build_accuracy(cfg: AccuracyConfig):
                     inputs, labels = batch
                     inputs, labels = inputs.to(device), labels.to(device)
                 logits = model(inputs)
+                # A HuggingFace model returns an output object; the scores
+                # are its `.logits`.
+                logits = getattr(logits, "logits", logits)
+                if causal:
+                    # Position t predicts token t + 1. Comparing unshifted
+                    # logits with labels scored every prediction against the
+                    # token it was conditioned on.
+                    logits = logits[:, :-1, :]
+                    labels = labels[:, 1:]
                 if logits.dim() == 3:  # (B, T, V) -> flatten
-                    logits = logits.view(-1, logits.size(-1))
-                    labels = labels.view(-1)
+                    # reshape, not view: the causal shift above leaves a
+                    # non-contiguous slice that view() rejects.
+                    logits = logits.reshape(-1, logits.size(-1))
+                    labels = labels.reshape(-1)
                 mask = labels != cfg.ignore_index
                 logits = logits[mask]
                 labels = labels[mask]
@@ -116,7 +152,7 @@ def _build_perplexity(cfg: PerplexityConfig):
     import math
     import torch
 
-    def evaluate(model, dataloader, device="cpu"):
+    def evaluate(model, dataloader, device="cpu", **kwargs):
         model.eval()
         total_loss = 0.0
         n_tokens = 0
@@ -133,9 +169,16 @@ def _build_perplexity(cfg: PerplexityConfig):
                     input_ids, labels = batch
                     input_ids, labels = input_ids.to(device), labels.to(device)
                 outputs = model(input_ids, labels=labels)
-                total_loss += outputs.loss.item() * labels.numel()
-                n_tokens += labels.numel()
-        avg_loss = total_loss / max(n_tokens, 1)
+                # The model's loss is a mean over the tokens it predicted:
+                # every position but the first, excluding ignored labels.
+                # Weighting each batch by that count (not by labels.numel(),
+                # as this did) makes the result a true per-token mean.
+                predicted = int((labels[..., 1:] != -100).sum())
+                total_loss += outputs.loss.item() * predicted
+                n_tokens += predicted
+        if n_tokens == 0:
+            raise ValueError("perplexity: no predicted tokens in the dataset")
+        avg_loss = total_loss / n_tokens
         return {"perplexity": math.exp(avg_loss), "loss": avg_loss}
 
     return evaluate

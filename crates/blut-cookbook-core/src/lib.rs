@@ -30,11 +30,17 @@ static CORE_STAGES_ERASED: &[(&str, ErasedStageCtor)] = &[
     (<TrainModel as Stage>::NAME, || {
         Arc::new(TrainModel) as Arc<dyn StageDyn>
     }),
+    (<TrainModelOnSplit as Stage>::NAME, || {
+        Arc::new(TrainModelOnSplit) as Arc<dyn StageDyn>
+    }),
     (<EvaluateModel as Stage>::NAME, || {
         Arc::new(EvaluateModel) as Arc<dyn StageDyn>
     }),
     (<EvaluateLoadedDataset as Stage>::NAME, || {
         Arc::new(EvaluateLoadedDataset) as Arc<dyn StageDyn>
+    }),
+    (<EvaluateHeldOut as Stage>::NAME, || {
+        Arc::new(EvaluateHeldOut) as Arc<dyn StageDyn>
     }),
 ];
 
@@ -90,8 +96,10 @@ mod tests {
             [
                 LoadDataset::NAME,
                 TrainModel::NAME,
+                TrainModelOnSplit::NAME,
                 EvaluateModel::NAME,
                 EvaluateLoadedDataset::NAME,
+                EvaluateHeldOut::NAME,
             ],
             "all core stages registered in canonical order"
         );

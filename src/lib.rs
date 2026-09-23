@@ -40,6 +40,7 @@ pub mod backends;
 pub mod conversations;
 pub mod convert;
 pub mod distributed;
+pub mod evaluator;
 pub mod stages;
 
 /// Process-wide lock for tests that mutate environment variables.
@@ -94,6 +95,7 @@ static STANDARD_STAGES_ERASED: &[(&str, blut::framework::stage::ErasedStageCtor)
         std::sync::Arc::new(stages::RegisterDataset)
     }),
     ("take_train", || std::sync::Arc::new(stages::TakeTrain)),
+    ("take_eval", || std::sync::Arc::new(stages::TakeEval)),
     ("sft_train", || std::sync::Arc::new(stages::SftTrain)),
     ("dpo_train", || std::sync::Arc::new(stages::DpoTrain)),
     ("distill_train", || {
