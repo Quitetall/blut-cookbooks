@@ -8,6 +8,21 @@
 //! overrides `--nnodes`), and it never passed `--node_rank` at all. One
 //! module now owns the decision so a fix lands everywhere at once.
 
+/// Serde default for a process or node count: one.
+pub fn one() -> u32 {
+    1
+}
+
+/// Serde `skip_serializing_if` for a count left at its default of one.
+///
+/// Stage and recipe arguments are serialized into cache keys and plan
+/// identities. Omitting a count at its default keeps every run that never set
+/// one at the identity it had before the field existed, instead of missing the
+/// cache on an argument that changes nothing.
+pub fn is_one(n: &u32) -> bool {
+    *n == 1
+}
+
 /// Rendezvous coordinates for a multi-node `torchrun` launch.
 ///
 /// Held as data rather than read at the call site, so the launch decision is

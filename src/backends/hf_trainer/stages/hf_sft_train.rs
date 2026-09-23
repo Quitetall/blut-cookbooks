@@ -44,6 +44,18 @@ pub struct Args {
     /// warmup_ratio, etc.) folded into the runner's `extra`.
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// Processes (GPUs) per node. >1 runs DDP under torchrun.
+    #[serde(
+        default = "crate::distributed::one",
+        skip_serializing_if = "crate::distributed::is_one"
+    )]
+    pub nproc_per_node: u32,
+    /// Nodes in the job. >1 needs MASTER_ADDR and NODE_RANK on every node.
+    #[serde(
+        default = "crate::distributed::one",
+        skip_serializing_if = "crate::distributed::is_one"
+    )]
+    pub nnodes: u32,
 }
 
 fn default_method() -> String {
@@ -77,6 +89,12 @@ impl Stage for HfSftTrain {
     type Input = DatasetJsonl;
     type Output = HfCheckpoint;
     type Args = Args;
+
+    /// One GPU permit per local rank, so the scheduler does not place other
+    /// GPU work on cards this job is using.
+    fn gpu_permits(&self, args: &Args) -> u32 {
+        args.nproc_per_node.max(1)
+    }
 
     async fn run(
         &self,
@@ -152,7 +170,8 @@ impl Stage for HfSftTrain {
             extra: args.extra.clone(),
             peft,
             dpo: None,
-            nproc_per_node: 1,
+            nproc_per_node: args.nproc_per_node,
+            nnodes: args.nnodes,
         };
 
         // Fan tqdm-style step events into the executor's status
@@ -256,6 +275,8 @@ mod tests {
                     seed: 42,
                     eval_dataset_path: String::new(),
                     extra: serde_json::Map::new(),
+                    nproc_per_node: 1,
+                    nnodes: 1,
                 },
             )
             .await;
@@ -282,6 +303,8 @@ mod tests {
                     seed: 42,
                     eval_dataset_path: String::new(),
                     extra: serde_json::Map::new(),
+                    nproc_per_node: 1,
+                    nnodes: 1,
                 },
             )
             .await;
@@ -291,5 +314,36 @@ mod tests {
     #[test]
     fn deterministic_false() {
         const { assert!(!<HfSftTrain as Stage>::DETERMINISTIC) };
+    }
+
+    fn minimal_args() -> serde_json::Value {
+        serde_json::json!({"base_model": "org/model", "lr": 1e-4, "epochs": 1})
+    }
+
+    /// Stage arguments feed the cache key. A run that never sets the
+    /// distributed counts must serialize exactly as it did before they
+    /// existed, or it misses the cache on arguments that change nothing.
+    #[test]
+    fn default_distributed_counts_are_not_serialized() {
+        let args: Args = serde_json::from_value(minimal_args()).unwrap();
+        assert_eq!((args.nproc_per_node, args.nnodes), (1, 1));
+        let json = serde_json::to_value(&args).unwrap();
+        assert!(json.get("nproc_per_node").is_none());
+        assert!(json.get("nnodes").is_none());
+    }
+
+    #[test]
+    fn distributed_counts_reach_the_gpu_permits() {
+        let mut v = minimal_args();
+        v["nproc_per_node"] = 4.into();
+        v["nnodes"] = 2.into();
+        let args: Args = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            HfSftTrain.gpu_permits(&args),
+            4,
+            "one permit per local rank"
+        );
+        let json = serde_json::to_value(&args).unwrap();
+        assert_eq!(json["nnodes"], 2);
     }
 }

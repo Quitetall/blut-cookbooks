@@ -71,13 +71,13 @@ pub struct HfTrainerJob {
     /// DPO-specific (ignored when task != "dpo").
     #[serde(default)]
     pub dpo: Option<DpoConfig>,
-    /// Number of GPUs for DDP. 1 = single-GPU (default). >1 = torchrun DDP.
-    #[serde(default = "default_nproc")]
+    /// Processes (GPUs) per node. >1 runs DDP under torchrun.
+    #[serde(default = "crate::distributed::one")]
     pub nproc_per_node: u32,
-}
-
-fn default_nproc() -> u32 {
-    1
+    /// Nodes in the job. >1 needs MASTER_ADDR and NODE_RANK on every node;
+    /// the wrapper then also saves a checkpoint on each node.
+    #[serde(default = "crate::distributed::one")]
+    pub nnodes: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -153,6 +153,8 @@ pub enum RunError {
     },
     #[error("serialize job spec: {0}")]
     SerializeJob(#[source] serde_json::Error),
+    #[error("distributed launch: {0}")]
+    Launch(String),
 }
 
 pub struct HfTrainerRunner {
@@ -208,18 +210,14 @@ impl HfTrainerRunner {
             }
         };
 
-        // DDP: when nproc_per_node > 1, launch via torchrun
-        let nproc = job.nproc_per_node.max(1);
+        // Under torchrun whenever the job spans more than one process, on
+        // one node or several. This gated on `nproc_per_node > 1` alone and
+        // always passed `--standalone`, so a multi-node HF job could not be
+        // expressed at all.
+        let prefix = crate::distributed::launch_prefix(job.nproc_per_node, job.nnodes)
+            .map_err(RunError::Launch)?;
         let mut cmd = Command::new(&python);
-        if nproc > 1 {
-            cmd.args([
-                "-m",
-                "torch.distributed.run",
-                "--standalone",
-                "--nproc_per_node",
-                &nproc.to_string(),
-            ]);
-        }
+        cmd.args(&prefix);
         cmd.arg(&wrapper).arg(&spec_path);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -421,6 +419,7 @@ mod tests {
             }),
             dpo: None,
             nproc_per_node: 1,
+            nnodes: 1,
         };
         let s = serde_json::to_string(&job).unwrap();
         let back: HfTrainerJob = serde_json::from_str(&s).unwrap();

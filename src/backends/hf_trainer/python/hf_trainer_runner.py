@@ -32,10 +32,56 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+def _is_local_leader() -> bool:
+    """True on the one process per node that reports status.
+
+    Under torchrun every rank runs this script and shares the node's stdout,
+    which the Rust runner parses as the status stream. Unguarded, N ranks
+    interleaved N copies of every step and done line. The leader is LOCAL rank
+    0, not global rank 0: each node's runner reads only its own node's stdout,
+    and a node with no reporting process would never see a done line and would
+    fail its stage.
+    """
+    return os.environ.get("LOCAL_RANK", "0") == "0"
+
+
 def emit(line: Dict[str, Any]) -> None:
-    """Write one status JSON line to stdout and flush."""
+    """Write one status JSON line to stdout and flush.
+
+    Progress and completion come from the node's leader only. A failure is
+    written by whichever rank hit it, since that rank may be the only one that
+    knows why the job died.
+    """
+    if line.get("kind") != "failed" and not _is_local_leader():
+        return
     sys.stdout.write(json.dumps(line, default=str) + "\n")
     sys.stdout.flush()
+
+
+def _bf16_supported() -> bool:
+    """Whether this machine can train in bf16.
+
+    Both trainers hard-coded `bf16=True`, which transformers rejects outright
+    on a GPU without bf16 (T4, V100) and on CPU. A job spec's `extra` can
+    still force either value.
+    """
+    try:
+        import torch
+    except ImportError:
+        return False
+    return bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+
+
+def _distributed_defaults(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """TrainingArguments that a multi-node job needs.
+
+    BLUT hands each node's stage its own output directory, with no shared
+    filesystem assumed. transformers saves on global rank 0 only by default,
+    which would leave every other node's stage pointing at an empty directory.
+    """
+    if int(spec.get("nnodes", 1)) > 1:
+        return {"save_on_each_node": True}
+    return {}
 
 
 def fail(msg: str) -> None:
@@ -141,7 +187,8 @@ def run_sft(spec: Dict[str, Any]) -> None:
         logging_steps=10,
         save_strategy="epoch",
         report_to=[],
-        bf16=True,
+        bf16=_bf16_supported(),
+        **_distributed_defaults(spec),
     )
     ta_kwargs.update(spec.get("extra") or {})
     if eval_ds is not None:
@@ -238,7 +285,8 @@ def run_dpo(spec: Dict[str, Any]) -> None:
         logging_steps=10,
         save_strategy="epoch",
         report_to=[],
-        bf16=True,
+        bf16=_bf16_supported(),
+        **_distributed_defaults(spec),
     )
 
     # DPO progress fan-out — same Step/Saved schema as SFT so the
