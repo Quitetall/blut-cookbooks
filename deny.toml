@@ -1,0 +1,50 @@
+# Dependency policy for blut-cookbooks, enforced by the `deny` job in
+# .github/workflows/ci.yml. Modeled on the engine's own deny.toml.
+
+[graph]
+all-features = true
+
+[advisories]
+# Every entry needs a reason, and an unmaintained-only advisory is the only
+# kind that may be ignored. A vulnerability is fixed, not waived.
+ignore = [
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3 is unmaintained but has no known vulnerability; it arrives through the blut engine, whose own deny.toml carries the same waiver until the engine migrates its cache and P2P wire codec" },
+]
+
+[licenses]
+confidence-threshold = 0.8
+# AGPL-3.0-or-later is the engine's license, and this workspace's
+# blut-cookbook-core crate. NOTICE explains the split.
+allow = [
+    "0BSD",
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Unlicense",
+    "Zlib",
+]
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The two crates in this workspace reference each other by path.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

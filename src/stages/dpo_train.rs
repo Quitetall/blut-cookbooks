@@ -1,9 +1,9 @@
-//! Stage 8 — `dpo_train`. Wraps trainer_dpo.py.
+//! Stage 8 — `dpo_train`. Deprecated: fails with guidance to `hf_dpo_train`.
 //!
-//! Full DPO implementation pending in a follow-up. Rust-side
-//! typed contract is complete; the Python side currently emits
-//! Failed for non-self-check invocations. Recipe + executor wiring
-//! works end-to-end as a smoke target.
+//! Its `trainer_dpo.py` stub was deleted under ADR 0037 Stage 5 rather than
+//! completed. The stage stays registered only so that a recipe still naming it
+//! fails with that guidance instead of an unresolved-script error. Real DPO
+//! runs through `hf_dpo_train` (trl's `DPOTrainer`).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

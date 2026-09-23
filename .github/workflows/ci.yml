@@ -1,7 +1,6 @@
-# First CI for blut-backends (2026-09-02). Until now this repository had no
-# workflow at all: no fmt, no clippy, no tests, no secret scan. Hosted ubuntu
-# only -- the LamQuant self-hosted runner is registered to the meta repository
-# and serves nothing else.
+# CI for blut-cookbooks. Hosted ubuntu only -- the LamQuant self-hosted runner
+# is registered to the meta repository and serves nothing else. Every action is
+# pinned by commit SHA.
 name: ci
 on:
   push:
@@ -28,21 +27,67 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
-      # `blut` is a private git dependency; cargo's own fetch needs a credential
-      # that can read it. SUBMODULE_TOKEN is the fleet's read-only PAT (the same
-      # secret name the LamQuant meta uses); github.token is the fallback and
-      # cannot read a sibling private repository, so until that secret exists on
-      # this repository the clippy/test steps fail at dependency resolution.
-      - name: Authenticate cargo git fetches
-        env:
-          GH_FLEET_TOKEN: ${{ secrets.SUBMODULE_TOKEN || github.token }}
-        run: |
-          git config --global \
-            url."https://x-access-token:${GH_FLEET_TOKEN}@github.com/".insteadOf \
-            "https://github.com/"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      # --workspace: without it clippy lints only the root package, and
+      # crates/blut-cookbook-core was never linted at all.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --locked --workspace --no-fail-fast
+
+  msrv:
+    name: compile on the declared MSRV (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Both manifests declare rust-version = "1.88"; until this job existed
+      # nothing built them on it.
+      - run: cargo check --workspace --all-targets --locked
+
+  python:
+    name: python (blut_core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # CPU torch: the trainer and step tests need it, a GPU they do not.
+      # Until this job existed the Python suite ran nowhere, and two of its
+      # tests had been failing against a script deleted in August.
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install pytest transformers
+      - run: python -m pytest -q python
+        env:
+          PYTHONPATH: python
+
+  deny:
+    name: advisories · licenses · sources (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: stable
+      # NOTICE has long said CI enforces dependency licenses with cargo-deny.
+      # Until this job it did not: there was no deny.toml and no such step.
+      - run: cargo install cargo-deny --version 0.20.2 --locked
+      - run: cargo deny --all-features check
+
   secret-scan:
     name: secret-scan (gitleaks, full history)
     runs-on: ubuntu-latest

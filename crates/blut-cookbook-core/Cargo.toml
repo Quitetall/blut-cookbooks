@@ -13,7 +13,7 @@ authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "Core BLUT cookbook — generic ML training primitives (data/optimizer/scheduler/loss/checkpoint)."
 rust-version = "1.85"
-repository = "https://github.com/Quitetall/blut-backends"
+repository = "https://github.com/Quitetall/blut-cookbooks"
 
 [lib]
 path = "src/lib.rs"

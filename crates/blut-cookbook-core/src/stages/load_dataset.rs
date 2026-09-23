@@ -106,14 +106,12 @@ impl Stage for LoadDataset {
                 }
                 let status = cmd.status().map_err(|e| {
                     StageError::Backend(anyhow::anyhow!(
-                        "failed to run blut_core.load_dataset: {}",
-                        e
+                        "failed to run blut_core.load_dataset: {e}"
                     ))
                 })?;
                 if !status.success() {
                     return Err(StageError::Backend(anyhow::anyhow!(
-                        "blut_core.load_dataset exited with {}",
-                        status
+                        "blut_core.load_dataset exited with {status}"
                     )));
                 }
                 if !output_path.exists() {

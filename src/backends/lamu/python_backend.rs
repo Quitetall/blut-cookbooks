@@ -89,7 +89,7 @@ impl TrainBackend for PythonTrainBackend {
     async fn run(&mut self, spec: TrainSpec, on_status: StatusFn) -> Result<TrainArtifact> {
         spec.validate()?;
         let spec_json = serde_json::to_string(&spec)
-            .map_err(|e| TrainError::other(format!("serialize TrainSpec for trainer.py: {}", e)))?;
+            .map_err(|e| TrainError::other(format!("serialize TrainSpec for trainer.py: {e}")))?;
 
         // Local spawns the trainer directly (byte-identical to the original);
         // Slurm/Ray wrap `python script spec` via the launcher (program/argv/env
@@ -302,7 +302,7 @@ impl TrainBackend for PythonTrainBackend {
         let exit_status = child
             .wait()
             .await
-            .map_err(|e| TrainError::Trainer(format!("wait for trainer.py: {}", e)))?;
+            .map_err(|e| TrainError::Trainer(format!("wait for trainer.py: {e}")))?;
 
         // Child exited — stop the watchdog if it's still ticking.
         if let Some(w) = &watchdog {
@@ -335,8 +335,7 @@ impl TrainBackend for PythonTrainBackend {
         }
         if !exit_status.success() {
             return Err(TrainError::Trainer(format!(
-                "trainer.py exited with {} and emitted no Failed status",
-                exit_status
+                "trainer.py exited with {exit_status} and emitted no Failed status"
             )));
         }
         let (final_loss, checkpoint_dir) = last_done.ok_or_else(|| {

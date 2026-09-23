@@ -227,13 +227,12 @@ impl Stage for TrainModel {
         }
 
         let status = cmd.status().map_err(|e| {
-            StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {}", e))
+            StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {e}"))
         })?;
 
         if !status.success() {
             return Err(StageError::Backend(anyhow::anyhow!(
-                "blut_core.trainer exited with {}",
-                status
+                "blut_core.trainer exited with {status}"
             )));
         }
 
@@ -250,7 +249,7 @@ impl Stage for TrainModel {
         }
 
         let content_hash = ContentHash::hash_dir(&output_dir)
-            .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {}", e)))?;
+            .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {e}")))?;
 
         Ok(HfCheckpoint {
             path: output_dir,
