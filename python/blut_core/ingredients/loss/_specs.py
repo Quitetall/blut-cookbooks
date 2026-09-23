@@ -1,6 +1,7 @@
 """Generic loss ingredient specs.
 
-Provides common loss functions: cross-entropy, MSE, contrastive, and DPO.
+Provides common loss functions: cross-entropy, causal-LM next-token
+cross-entropy, MSE, contrastive, and DPO.
 Domain cookbooks override with domain-specific losses (e.g. LamQuant's
 joint codec loss).
 """
@@ -25,6 +26,13 @@ def _build_cross_entropy(cfg: CrossEntropyConfig):
     import torch.nn.functional as F
 
     def loss_fn(logits, targets):
+        if hasattr(logits, "logits"):
+            # A HuggingFace model output, not a logits tensor. Say which loss
+            # was meant instead of letting F.cross_entropy reject the type.
+            raise TypeError(
+                "cross_entropy expects a logits tensor but got a "
+                f"{type(logits).__name__}; for a HuggingFace causal LM use the "
+                "'causal_lm' loss, which trains on next-token prediction")
         return F.cross_entropy(
             logits, targets,
             label_smoothing=cfg.label_smoothing,
@@ -41,6 +49,47 @@ def _cross_entropy():
         name="cross_entropy", kind="loss", config_cls=CrossEntropyConfig,
         cache_relevant=True,
         build=_build_cross_entropy,
+    )
+
+
+# ---- Causal LM (next-token prediction) ---------------------------------
+@dataclass(frozen=True)
+class CausalLmConfig:
+    ignore_index: int = -100
+
+
+def _build_causal_lm(cfg: CausalLmConfig):
+    import torch.nn.functional as F
+
+    def loss_fn(output, batch):
+        """Next-token cross-entropy for a causal LM.
+
+        A HuggingFace model given `labels` already returns this loss as
+        `output.loss`, computed with the one-token shift; use it. Otherwise
+        shift here: position t predicts token t + 1.
+        """
+        loss = getattr(output, "loss", None)
+        if loss is not None:
+            return loss
+        logits = getattr(output, "logits", output)
+        labels = batch["labels"]
+        shifted = logits[..., :-1, :].contiguous()
+        targets = labels[..., 1:].contiguous()
+        return F.cross_entropy(
+            shifted.view(-1, shifted.size(-1)),
+            targets.view(-1),
+            ignore_index=cfg.ignore_index,
+        )
+
+    return loss_fn
+
+
+@register_ingredient
+def _causal_lm():
+    return IngredientSpec(
+        name="causal_lm", kind="loss", config_cls=CausalLmConfig,
+        cache_relevant=True,
+        build=_build_causal_lm,
     )
 
 
