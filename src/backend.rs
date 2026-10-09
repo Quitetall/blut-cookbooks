@@ -38,6 +38,9 @@ pub struct TrainArtifact {
 /// lifetime to a borrowed handler.
 pub type StatusFn = Box<dyn Fn(StatusUpdate) + Send + Sync + 'static>;
 
+// async_trait inserts #[must_use] on trait futures; Future is already must-use.
+// Keep unused futures diagnosed while tolerating that generated duplicate.
+#[allow(clippy::double_must_use, reason = "attribute inserted by async_trait")]
 #[async_trait]
 pub trait TrainBackend: Send + Sync {
     /// Run a single training job to completion. Streams `StatusUpdate`s
