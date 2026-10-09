@@ -1,4 +1,4 @@
-blut-backends
+blut-cookbooks
 Copyright 2026 Brian Lam
 
 This product includes software developed for the BLUT project.
@@ -39,7 +39,8 @@ whole purpose is the engine's backend seam.
 Third-party dependencies
 --------------------------------------------------------------------------
 
-Dependency licenses are enforced in CI by `cargo-deny` (see the audit
-workflow), which fails on any license outside the allowed set. That check
+Dependency licenses are enforced in CI by `cargo-deny` (the `deny` job in
+.github/workflows/ci.yml, policy in deny.toml), which fails on any license
+outside the allowed set. That check
 covers the dependency graph; it does not and cannot decide the question above,
 which is about how THIS code is combined with the engine.

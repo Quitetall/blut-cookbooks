@@ -5,20 +5,19 @@
 //! checkpoint + the eval split. Output is an `EvalReport` with
 //! `{loss, perplexity, n_examples}` at the metric root.
 //!
-//! Implementation note: this commit ships the framework wiring +
-//! a synthetic-result fallback path so the recipe DAG can be
-//! exercised end-to-end without the Python evaluator. Real
-//! evaluation lands in a follow-up that shells out to
-//! `python/eval_loss.py` (the trainer's existing `--eval-only`
-//! mode is the obvious shim). The synthetic path computes
-//! `loss = 0.5 + (input_hash[0] as f32 / 512.0)` so test runs
-//! get a deterministic non-trivial number per checkpoint.
+//! Runs the `blut_core.evaluator` Python module with the `perplexity` eval
+//! ingredient: text rows are packed into `max_seq`-token blocks with the
+//! checkpoint's own tokenizer, exactly as training packs them, and the
+//! model's next-token loss is averaged over them.
+//!
+//! Until this change the stage computed `loss = 0.5 + hash_byte / 512` from
+//! the checkpoint's content hash and returned it as a measurement, marked
+//! only by a `"synthetic": true` key that nothing downstream read.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use blut::artifacts::{DatasetJsonl, EvalReport, HfCheckpoint};
-use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
@@ -42,7 +41,9 @@ fn default_max_seq() -> u32 {
 #[async_trait]
 impl Stage for EvalLoss {
     const NAME: &'static str = "eval_loss";
-    const SCHEMA: u32 = 1;
+    // 2: measures instead of deriving a number from the checkpoint hash;
+    // cached v1 reports are invalid.
+    const SCHEMA: u32 = 2;
     const RESOURCES: &'static [Resource] = &[Resource::Gpu];
     type Input = (HfCheckpoint, DatasetJsonl);
     type Output = EvalReport;
@@ -55,36 +56,36 @@ impl Stage for EvalLoss {
         args: &Args,
     ) -> Result<EvalReport, StageError> {
         // R21 + R23: arg + input sanity.
-        debug_assert!(input.1.n_examples > 0, "eval dataset must have examples");
+        if input.1.n_examples <= 0 {
+            return Err(StageError::BadInput(format!(
+                "eval_loss: eval dataset has {} examples",
+                input.1.n_examples
+            )));
+        }
         if args.batch_size == 0 || args.max_seq == 0 {
             return Err(StageError::BadInput(
                 "batch_size + max_seq must be > 0".into(),
             ));
         }
         let (ckpt, ds) = input;
-        // Synthetic-result fallback (see module doc).
-        let seed = ckpt.content_hash.0[0] as f32;
-        let loss = 0.5 + seed / 512.0;
-        let metrics = serde_json::json!({
-            "loss": loss,
-            "perplexity": loss.exp(),
-            "n_examples": ds.n_examples,
-            "batch_size": args.batch_size,
-            "max_seq": args.max_seq,
-            "synthetic": true,
-        });
-        let path = ctx.stage_dir.join("eval_loss.json");
-        super::util::write_report(&path, &metrics)?;
-        let content_hash = ContentHash::hash_file(&path).map_err(|source| StageError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        Ok(EvalReport {
-            path,
-            evaluator: "eval_loss".into(),
-            metrics,
-            content_hash,
-        })
+        let mut report = crate::evaluator::run_evaluator(
+            ctx,
+            &crate::evaluator::EvalRequest {
+                checkpoint_path: &ckpt.path,
+                dataset_path: &ds.path,
+                eval: serde_json::json!({"kind": "eval", "name": "perplexity", "config": {}}),
+                loss: None,
+                batch_size: args.batch_size,
+                device: "cuda",
+                text_field: None,
+                max_seq_len: Some(args.max_seq),
+            },
+            "eval_loss",
+        )?;
+        if let Some(metrics) = report.metrics.as_object_mut() {
+            metrics.insert("n_examples".into(), ds.n_examples.into());
+        }
+        Ok(report)
     }
 }
 
@@ -100,6 +101,7 @@ impl Default for Args {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blut::framework::artifact::ContentHash;
     use std::path::PathBuf;
 
     fn ckpt(byte: u8) -> HfCheckpoint {
@@ -123,36 +125,34 @@ mod tests {
         StageContext::for_test(td.to_path_buf(), td.join("stage"))
     }
 
+    /// It used to report a loss for a checkpoint that does not exist. A
+    /// measurement needs something to measure.
     #[tokio::test]
-    async fn produces_a_report() {
+    async fn refuses_a_checkpoint_that_does_not_exist() {
         let td = tempfile::tempdir().unwrap();
+        let data = td.path().join("eval.jsonl");
+        std::fs::write(&data, "{\"text\": \"hello\"}\n").unwrap();
+        let mut d = ds();
+        d.path = data;
+        let mut c = ckpt(0);
+        c.path = td.path().join("no-such-checkpoint");
         let r = EvalLoss
-            .run(
-                &ctx(td.path()),
-                (ckpt(0), ds()),
-                &Args {
-                    batch_size: 1,
-                    max_seq: 4096,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(r.evaluator, "eval_loss");
-        assert_eq!(r.metrics["n_examples"], serde_json::json!(50));
-        assert!(r.metrics["loss"].as_f64().unwrap() > 0.0);
+            .run(&ctx(td.path()), (c, d), &Args::default())
+            .await;
+        assert!(
+            matches!(&r, Err(StageError::BadInput(m)) if m.contains("checkpoint not found")),
+            "got {r:?}"
+        );
     }
 
     #[tokio::test]
-    async fn loss_varies_with_checkpoint() {
+    async fn refuses_an_empty_eval_split() {
         let td = tempfile::tempdir().unwrap();
-        let r1 = EvalLoss
-            .run(&ctx(td.path()), (ckpt(0), ds()), &Args::default())
-            .await
-            .unwrap();
-        let r2 = EvalLoss
-            .run(&ctx(td.path()), (ckpt(64), ds()), &Args::default())
-            .await
-            .unwrap();
-        assert_ne!(r1.metrics["loss"], r2.metrics["loss"]);
+        let mut d = ds();
+        d.n_examples = 0;
+        let r = EvalLoss
+            .run(&ctx(td.path()), (ckpt(0), d), &Args::default())
+            .await;
+        assert!(matches!(r, Err(StageError::BadInput(_))));
     }
 }

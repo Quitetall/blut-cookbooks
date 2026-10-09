@@ -28,7 +28,6 @@ from blut_core.run_manifest import (
     _ulid,
 )
 
-pytestmark = pytest.mark.l2
 
 
 # ============================================================

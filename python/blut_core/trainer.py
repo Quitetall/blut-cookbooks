@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from blut_core import build_ingredient, list_ingredients
+from blut_core.lm_data import is_causal_lm, pack_token_blocks, texts_from_rows
 from blut_core.spec import KINDS
 
 
@@ -344,23 +345,9 @@ def build_all_ingredients(config: dict) -> dict:
     ingredients["model"] = build_ingredient(
         model_cfg["kind"], model_cfg["name"], model_cfg.get("config"))
 
-    # Build optimizer (needs model params)
-    opt_cfg = config["optimizer"]
-    if _is_rank0():
-        print(f"[trainer] building optimizer: {opt_cfg['kind']}:{opt_cfg['name']}")
-    model = ingredients["model"]
-    named_params = list(model.named_parameters()) if hasattr(model, 'named_parameters') else []
-    ingredients["optimizer"] = build_ingredient(
-        opt_cfg["kind"], opt_cfg["name"], opt_cfg.get("config"),
-        named_params=named_params)
-
-    # Build scheduler (needs optimizer)
-    sched_cfg = config["scheduler"]
-    if _is_rank0():
-        print(f"[trainer] building scheduler: {sched_cfg['kind']}:{sched_cfg['name']}")
-    ingredients["scheduler"] = build_ingredient(
-        sched_cfg["kind"], sched_cfg["name"], sched_cfg.get("config"),
-        optimizer=ingredients["optimizer"])
+    # The optimizer and scheduler are NOT built here: they must be built from
+    # the parameters the model has after it is placed and wrapped. See
+    # build_optimization.
 
     # Build loss
     loss_cfg = config["loss"]
@@ -389,36 +376,112 @@ def build_all_ingredients(config: dict) -> dict:
     return ingredients
 
 
+def build_optimization(config: dict, model) -> tuple:
+    """Build the optimizer and scheduler over `model`'s CURRENT parameters.
+
+    Call this after the model is moved and wrapped. FSDP2's `fully_shard`
+    replaces every parameter with a sharded DTensor, so an optimizer built
+    beforehand (as this trainer used to) holds the old, unsharded tensors: its
+    `step()` updates tensors the model no longer uses, and training silently
+    changes nothing. DDP keeps the same parameter objects, but names them
+    `module.<name>`; building from the unwrapped module keeps name-based
+    parameter-group rules (no weight decay on biases, say) matching.
+    """
+    opt_cfg = config["optimizer"]
+    if _is_rank0():
+        print(f"[trainer] building optimizer: {opt_cfg['kind']}:{opt_cfg['name']}")
+    base = _ddp_unwrap(model)
+    named_params = list(base.named_parameters()) if hasattr(base, "named_parameters") else []
+    optimizer = build_ingredient(
+        opt_cfg["kind"], opt_cfg["name"], opt_cfg.get("config"),
+        named_params=named_params)
+
+    sched_cfg = config["scheduler"]
+    if _is_rank0():
+        print(f"[trainer] building scheduler: {sched_cfg['kind']}:{sched_cfg['name']}")
+    scheduler = build_ingredient(
+        sched_cfg["kind"], sched_cfg["name"], sched_cfg.get("config"),
+        optimizer=optimizer)
+    return optimizer, scheduler
+
+
 # ---------------------------------------------------------------------------
 # Dataset loading
 # ---------------------------------------------------------------------------
 
-def load_dataset(config: dict):
-    """Load the dataset from the config."""
-    dataset_path = config["dataset_path"]
+def load_dataset(config: dict) -> list:
+    """Read the dataset rows from `config["dataset_path"]`.
 
-    # Try to load as JSONL
-    if str(dataset_path).endswith(".jsonl"):
-        texts = []
-        with open(dataset_path) as f:
-            for line in f:
-                if line.strip():
-                    texts.append(json.loads(line))
-        if _is_rank0():
-            print(f"[trainer] loaded {len(texts)} examples from {dataset_path}")
-        return texts
+    Accepts JSONL (one object per line) or a JSON array. Every failure raises.
+    This used to print a warning and return `[]` when the file could not be
+    read, and the training loop then ran zero batches and reported success —
+    a missing dataset produced a checkpoint.
+    """
+    path = Path(config["dataset_path"])
+    if not path.is_file():
+        raise FileNotFoundError(f"dataset_path is not a file: {path}")
+    if path.suffix == ".json":
+        with open(path) as f:
+            rows = json.load(f)
+        if not isinstance(rows, list):
+            raise ValueError(f"{path}: expected a JSON array of rows")
+    else:
+        rows = []
+        with open(path) as f:
+            for lineno, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"{path}:{lineno}: not valid JSON: {e}") from e
+    if not rows:
+        raise ValueError(f"{path} holds no rows; refusing to train on nothing")
+    if _is_rank0():
+        print(f"[trainer] loaded {len(rows)} rows from {path}")
+    return rows
 
-    # Fallback: try HuggingFace datasets
-    try:
-        from datasets import load_dataset
-        ds = load_dataset("json", data_files=str(dataset_path), split="train")
-        if _is_rank0():
-            print(f"[trainer] loaded {len(ds)} examples from {dataset_path}")
-        return ds
-    except Exception as e:
-        if _is_rank0():
-            print(f"[trainer] warning: could not load dataset: {e}")
-        return []
+
+def _keep_rows(batch):
+    """Collate that hands the step the rows unchanged, as a list.
+
+    Module-level (not a lambda) so DataLoader worker processes can pickle it.
+    """
+    return batch
+
+
+def _stack_blocks(batch):
+    """Collate packed causal-LM blocks into `input_ids`/`labels` tensors.
+
+    The labels are the inputs: a HuggingFace causal LM shifts them by one
+    position internally when it computes its loss.
+    """
+    import torch
+    ids = torch.tensor(batch, dtype=torch.long)
+    return {"input_ids": ids, "labels": ids.clone()}
+
+
+def prepare_dataset(config: dict, rows: list, model):
+    """Turn raw rows into what the step consumes. Returns (dataset, collate, tokenizer).
+
+    For a HuggingFace causal LM, text rows are tokenized with the model's own
+    tokenizer and packed into `max_seq_len` blocks (see `blut_core.lm_data`).
+    Any other model gets the rows untouched, as before, and `tokenizer` is None.
+    """
+    if not is_causal_lm(model):
+        return rows, _keep_rows, None
+
+    from transformers import AutoTokenizer
+    # The Rust stage writes these keys as JSON null when unset.
+    text_field = config.get("text_field") or "text"
+    block_size = int(config.get("max_seq_len") or 512)
+    source = config.get("tokenizer") or _ddp_unwrap(model).name_or_path
+    tokenizer = AutoTokenizer.from_pretrained(source)
+    blocks = pack_token_blocks(texts_from_rows(rows, text_field), tokenizer, block_size)
+    if _is_rank0():
+        print(f"[trainer] packed {len(rows)} rows into {len(blocks)} blocks "
+              f"of up to {block_size} tokens (tokenizer: {source})")
+    return blocks, _stack_blocks, tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -430,8 +493,6 @@ def train_loop(config: dict, ingredients: dict, dataset):
     import torch
 
     model = ingredients["model"]
-    optimizer = ingredients["optimizer"]
-    scheduler = ingredients["scheduler"]
     loss_fn = ingredients["loss"]
     step_fn = ingredients["step"]
     emit = ingredients["logging"]
@@ -470,35 +531,45 @@ def train_loop(config: dict, ingredients: dict, dataset):
             model = model.to("cpu")
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Optimizer and scheduler come after placement and wrapping, from the
+    # parameters the model will actually train with (see build_optimization).
+    optimizer, scheduler = build_optimization(config, model)
+
+    batch_size = int(config.get("batch_size", 32))
+    world = _ddp_world_size()
     if _is_rank0():
         print(f"[trainer] starting training: {epochs} epochs, "
                f"device={device}, ddp={ddp}, strategy={strategy}, "
-               f"world_size={_ddp_world_size()}")
+               f"world_size={world}, batch_size={batch_size} per rank, "
+               f"global_batch={batch_size * world}")
         print(f"[trainer] available ingredients: {list_ingredients()}")
 
-    # Create dataloader
-    if isinstance(dataset, list):
-        # JSONL dataset — simple batch iteration
-        dataloader = None  # handled inline
+    dataset, collate, tokenizer = prepare_dataset(config, dataset, model)
+
+    # One loading path for every dataset. JSONL rows used to be sliced by hand
+    # on every rank — each DDP rank iterated the WHOLE dataset, so N GPUs did
+    # the same work N times and the global batch was never what it claimed.
+    dl_kwargs = _dataloader_kwargs(config)
+    sampler = None
+    if ddp:
+        # Preserve the old DDP default (pin_memory=True) unless the config
+        # explicitly set pin_memory — otherwise existing DDP runs silently
+        # lose pinned H2D copies (a perf regression, not a correctness one).
+        if "pin_memory" not in config:
+            dl_kwargs["pin_memory"] = True
+        sampler, dataloader = _ddp_shard_dataset(
+            dataset, batch_size, seed, dict(dl_kwargs, collate_fn=collate))
     else:
-        batch_size = config.get("batch_size", 32)
-        dl_kwargs = _dataloader_kwargs(config)
-        if ddp:
-            # Preserve the old DDP default (pin_memory=True) unless the config
-            # explicitly set pin_memory — otherwise existing DDP runs silently
-            # lose pinned H2D copies (a perf regression, not a correctness one).
-            if "pin_memory" not in config:
-                dl_kwargs["pin_memory"] = True
-            sampler, dataloader = _ddp_shard_dataset(dataset, batch_size, seed, dl_kwargs)
-        else:
-            dataloader = torch.utils.data.DataLoader(
-                dataset, batch_size=batch_size, shuffle=True, **dl_kwargs)
-        # Opt-in CUDA-stream prefetch: double-buffer the next batch onto a side
-        # stream while the model computes the current one (GPU only).
-        if (config.get("cuda_prefetch", False)
-                and not isinstance(dataset, list)
-                and str(device) != "cpu" and torch.cuda.is_available()):
-            dataloader = CudaPrefetcher(dataloader, device)
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=batch_size, shuffle=True, generator=generator,
+            collate_fn=collate, **dl_kwargs)
+    # Opt-in CUDA-stream prefetch: double-buffer the next batch onto a side
+    # stream while the model computes the current one (GPU only).
+    if (config.get("cuda_prefetch", False)
+            and str(device) != "cpu" and torch.cuda.is_available()):
+        dataloader = CudaPrefetcher(dataloader, device)
 
     # Training loop
     for epoch in range(1, epochs + 1):
@@ -506,45 +577,46 @@ def train_loop(config: dict, ingredients: dict, dataset):
         epoch_loss = 0.0
         n_batches = 0
 
-        # Set epoch for DDP sampler
-        if ddp and isinstance(dataset, list) is False and 'sampler' in dir():
+        if sampler is not None:
             sampler.set_epoch(epoch)
 
-        if isinstance(dataset, list):
-            # JSONL dataset — iterate in batches
-            batch_size = config.get("batch_size", 32)
-            for i in range(0, len(dataset), batch_size):
-                batch = dataset[i:i + batch_size]
-                try:
-                    loss = step_fn(model, optimizer, loss_fn, batch)
-                    epoch_loss += loss.item() if hasattr(loss, 'item') else float(loss)
-                    n_batches += 1
-                except Exception as e:
-                    if _is_rank0():
-                        print(f"[trainer] warning: batch {i} failed: {e}")
-                    continue
-        else:
-            # HuggingFace dataset with DataLoader
-            for batch in dataloader:
-                if isinstance(batch, dict):
-                    local_rank = _ddp_local_rank() if ddp else (0 if device == "cpu" else None)
-                    target_device = f"cuda:{local_rank}" if ddp and local_rank is not None else device
-                    batch = {k: v.to(target_device) if hasattr(v, 'to') else v
-                             for k, v in batch.items()}
-                try:
-                    loss = step_fn(model, optimizer, loss_fn, batch)
-                    epoch_loss += loss.item() if hasattr(loss, 'item') else float(loss)
-                    n_batches += 1
-                except Exception as e:
-                    if _is_rank0():
-                        print(f"[trainer] warning: batch failed: {e}")
-                    continue
+        # No exception is caught here. This loop used to catch every batch's
+        # exception, print a warning, and continue — so a run in which every
+        # batch failed averaged zero losses into `loss=0.0000`, saved a
+        # checkpoint, and exited 0. A failed batch now fails the run. Under
+        # DDP that is also the only safe choice: a rank that skips a batch
+        # its peers train on deadlocks the next gradient all-reduce.
+        target_device = (f"cuda:{_ddp_local_rank()}" if ddp
+                         else ("cpu" if device == "cpu" else device))
+        # Losses accumulate on the device. `.item()` per batch forces a
+        # host-device sync every step, stalling the queue of launched kernels
+        # for a number that is only reported once per epoch.
+        device_loss_sum = None
+        for batch in dataloader:
+            if isinstance(batch, dict):
+                batch = {k: v.to(target_device) if hasattr(v, "to") else v
+                         for k, v in batch.items()}
+            loss = step_fn(model, optimizer, loss_fn, batch)
+            if hasattr(loss, "detach"):
+                step_loss = loss.detach()
+                device_loss_sum = (step_loss if device_loss_sum is None
+                                   else device_loss_sum + step_loss)
+            else:
+                epoch_loss += float(loss)
+            n_batches += 1
+        if device_loss_sum is not None:
+            epoch_loss += device_loss_sum.item()
+
+        if n_batches == 0:
+            raise RuntimeError(
+                f"epoch {epoch} ran zero batches; the dataset yielded nothing "
+                "to train on for this rank")
 
         # Step scheduler (all ranks)
         if scheduler is not None:
             scheduler.step(epoch)
 
-        avg_loss = epoch_loss / max(n_batches, 1)
+        avg_loss = epoch_loss / n_batches
 
         # Reduce avg_loss across DDP ranks for consistent reporting
         if ddp:
@@ -600,6 +672,10 @@ def train_loop(config: dict, ingredients: dict, dataset):
             if strategy != "fsdp" and hasattr(base_model, 'save_pretrained'):
                 hf_dir = output_dir / "hf"
                 base_model.save_pretrained(str(hf_dir))
+                # Without its tokenizer an HF checkpoint cannot be loaded for
+                # inference by name alone; ship the one training used.
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(str(hf_dir))
                 print(f"[trainer] HF checkpoint saved to {hf_dir}")
         except Exception as e:
             print(f"[trainer] warning: could not save HF checkpoint: {e}")

@@ -26,6 +26,7 @@ pub mod register_dataset;
 pub mod register_model;
 pub mod sft_train;
 pub mod split_train_eval;
+pub mod take_eval;
 pub mod take_train;
 pub(crate) mod util;
 
@@ -48,4 +49,5 @@ pub use register_dataset::RegisterDataset;
 pub use register_model::RegisterModel;
 pub use sft_train::SftTrain;
 pub use split_train_eval::SplitTrainEval;
+pub use take_eval::TakeEval;
 pub use take_train::TakeTrain;

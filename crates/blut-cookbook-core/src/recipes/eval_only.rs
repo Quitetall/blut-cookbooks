@@ -12,6 +12,7 @@ use blut::framework::error::RecipeError;
 use blut::framework::plan::Plan;
 use blut::recipes::recipe::Recipe;
 
+use crate::recipes::shared::DatasetSelect;
 use crate::stages::IngredientCfg;
 use crate::stages::evaluate_model::{EvaluateLoadedDataset, LoadedDatasetArgs};
 use crate::stages::load_dataset::{Args as LoadArgs, LoadDataset};
@@ -41,6 +42,15 @@ pub struct Args {
     /// Device to evaluate on.
     #[serde(default = "default_device")]
     pub device: String,
+    /// `subset` and `max_samples`.
+    #[serde(flatten)]
+    pub dataset: DatasetSelect,
+    /// Causal-LM packing, as for training (evaluator default `"text"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_field: Option<String>,
+    /// Causal-LM packing, as for training (evaluator default 512).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_seq_len: Option<u32>,
 }
 
 fn default_split() -> String {
@@ -111,8 +121,8 @@ impl Recipe for EvalOnly {
                     path: args.dataset_path.clone(),
                     hf_name: args.hf_name.clone(),
                     split: args.split.clone(),
-                    subset: None,
-                    max_samples: None,
+                    subset: args.dataset.subset.clone(),
+                    max_samples: args.dataset.max_samples,
                 },
             )
             .then(
@@ -122,6 +132,8 @@ impl Recipe for EvalOnly {
                     eval: args.eval,
                     batch_size: args.batch_size,
                     device: args.device,
+                    text_field: args.text_field,
+                    max_seq_len: args.max_seq_len,
                 },
             )
             .finish();
@@ -157,6 +169,9 @@ mod tests {
                 eval: default_eval(),
                 batch_size: 1,
                 device: "cpu".into(),
+                dataset: DatasetSelect::default(),
+                text_field: None,
+                max_seq_len: None,
             })
             .unwrap()
             .into_compiled();

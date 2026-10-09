@@ -1,9 +1,10 @@
-//! Stage 9 — `distill_train`. Wraps trainer_distill.py.
+//! Stage 9 — `distill_train`. Deprecated: fails with guidance to its successors.
 //!
-//! Two-input stage: takes (HfCheckpoint teacher, DatasetJsonl) and
-//! produces an HfCheckpoint student. Teacher's outputs are sampled
-//! into the dataset path before training (the Python side handles
-//! that). Currently uses trainer_distill.py stub.
+//! Two-input stage: (HfCheckpoint teacher, DatasetJsonl) -> HfCheckpoint
+//! student. Its `trainer_distill.py` stub was deleted under ADR 0037 Stage 5
+//! rather than completed; the stage stays registered only so a recipe still
+//! naming it fails with guidance to the successors (blut-lamu's
+//! `distill_bitnet` for ternary students, `hf_sft_train` for HF ones).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

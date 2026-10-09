@@ -89,7 +89,7 @@ impl TrainBackend for PythonTrainBackend {
     async fn run(&mut self, spec: TrainSpec, on_status: StatusFn) -> Result<TrainArtifact> {
         spec.validate()?;
         let spec_json = serde_json::to_string(&spec)
-            .map_err(|e| TrainError::other(format!("serialize TrainSpec for trainer.py: {}", e)))?;
+            .map_err(|e| TrainError::other(format!("serialize TrainSpec for trainer.py: {e}")))?;
 
         // Local spawns the trainer directly (byte-identical to the original);
         // Slurm/Ray wrap `python script spec` via the launcher (program/argv/env
@@ -97,38 +97,15 @@ impl TrainBackend for PythonTrainBackend {
         //
         // DDP: when nproc_per_node > 1, launch via `torchrun --nproc_per_node=N`
         // instead of bare python, so the trainer auto-initializes DDP.
+        use crate::distributed::launch_prefix;
         use blut::config::launcher::{LaunchTarget, launcher_for};
         let nproc = spec.nproc_per_node.max(1);
         let nnodes = spec.nnodes.max(1);
         let mut cmd = match self.launch_target {
             LaunchTarget::Local => {
                 let mut c = Command::new(&self.python);
-                if nproc > 1 {
-                    // DDP mode: launch via torchrun
-                    c.args(["-m", "torch.distributed.run"]);
-                    if nnodes <= 1 {
-                        // Single-node DDP
-                        c.args(["--standalone", "--nproc_per_node", &nproc.to_string()]);
-                    } else {
-                        // Multi-node DDP: read rendezvous from env
-                        let master_addr =
-                            std::env::var("MASTER_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
-                        let master_port =
-                            std::env::var("MASTER_PORT").unwrap_or_else(|_| "29500".into());
-                        let node_rank = std::env::var("NODE_RANK").unwrap_or_else(|_| "0".into());
-                        c.args([
-                            "--nnodes",
-                            &nnodes.to_string(),
-                            "--nproc_per_node",
-                            &nproc.to_string(),
-                            "--rdzv_backend",
-                            "c10d",
-                            "--rdzv_endpoint",
-                            &format!("{master_addr}:{master_port}"),
-                            "--node_rank",
-                            &node_rank,
-                        ]);
-                    }
+                for arg in launch_prefix(nproc, nnodes).map_err(TrainError::other)? {
+                    c.arg(arg);
                 }
                 c.arg(&self.trainer_script).arg(&spec_json);
                 c
@@ -136,21 +113,19 @@ impl TrainBackend for PythonTrainBackend {
             target => {
                 let mut inner_args =
                     vec![self.trainer_script.display().to_string(), spec_json.clone()];
-                // For DDP on Slurm/Ray: prepend torchrun args
-                let inner_prog = if nproc > 1 {
-                    inner_args.insert(0, "torch.distributed.run".to_string());
-                    inner_args.insert(1, "--standalone".to_string());
-                    inner_args.insert(2, "--nproc_per_node".to_string());
-                    inner_args.insert(3, nproc.to_string());
-                    if spec.nnodes > 1 {
-                        inner_args.insert(4, "--nnodes".to_string());
-                        inner_args.insert(5, spec.nnodes.to_string());
-                    }
-                    inner_args.insert(0, "-m".to_string());
-                    self.python.display().to_string()
-                } else {
-                    self.python.display().to_string()
-                };
+                // Slurm/Ray: the same torchrun prefix the Local arm builds.
+                // It used to be assembled separately here, and got it wrong:
+                // `--standalone` went in unconditionally and `--nnodes N` was
+                // appended after it. `--standalone` *is* a single-node
+                // rendezvous and overrides `--nnodes`, so a multi-node job
+                // wrapped by a launcher silently ran as N disconnected
+                // single-node jobs — and no `--node_rank` or `--rdzv_endpoint`
+                // was ever passed for the nodes to find each other with.
+                let prefix = launch_prefix(nproc, nnodes).map_err(TrainError::other)?;
+                for (i, arg) in prefix.into_iter().enumerate() {
+                    inner_args.insert(i, arg);
+                }
+                let inner_prog = self.python.display().to_string();
                 let mut full_inner = vec![inner_prog];
                 full_inner.extend(inner_args);
                 let w = launcher_for(target)
@@ -327,7 +302,7 @@ impl TrainBackend for PythonTrainBackend {
         let exit_status = child
             .wait()
             .await
-            .map_err(|e| TrainError::Trainer(format!("wait for trainer.py: {}", e)))?;
+            .map_err(|e| TrainError::Trainer(format!("wait for trainer.py: {e}")))?;
 
         // Child exited — stop the watchdog if it's still ticking.
         if let Some(w) = &watchdog {
@@ -360,8 +335,7 @@ impl TrainBackend for PythonTrainBackend {
         }
         if !exit_status.success() {
             return Err(TrainError::Trainer(format!(
-                "trainer.py exited with {} and emitted no Failed status",
-                exit_status
+                "trainer.py exited with {exit_status} and emitted no Failed status"
             )));
         }
         let (final_loss, checkpoint_dir) = last_done.ok_or_else(|| {

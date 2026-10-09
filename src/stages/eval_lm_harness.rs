@@ -5,22 +5,25 @@
 //! Resource declaration is `[Gpu, Network]` because the harness
 //! downloads benchmark datasets on first use.
 //!
-//! Like `eval_loss`, this commit ships a synthetic fallback that
-//! computes a deterministic-per-checkpoint score per task. Real
-//! subprocess invocation lands in a follow-up that resolves
-//! `lm_eval` via `paths::resolve_python()` and parses the harness
-//! JSON output.
+//! The harness subprocess is not wired yet. Until it is, this stage refuses
+//! to run. It used to return a score derived from the checkpoint's content
+//! hash — `0.3 + (hash_byte / 255 + i * 0.05) % 0.6` per task — shaped
+//! exactly like a real result and marked only by a `"synthetic": true` key
+//! that nothing downstream read. A benchmark number that was never measured
+//! is worse than no number.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use blut::artifacts::{DatasetJsonl, EvalReport, HfCheckpoint};
-use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
 
 pub struct EvalLmHarness;
+
+/// Why this stage refuses to run. It used to fabricate a result instead.
+const NOT_IMPLEMENTED: &str = "eval_lm_harness is not implemented: it would run EleutherAI lm-evaluation-harness, and that subprocess is not wired yet. It no longer returns placeholder scores. Run lm_eval against the checkpoint directly until it lands.";
 
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Args {
@@ -35,7 +38,8 @@ fn default_num_fewshot() -> u32 {
 #[async_trait]
 impl Stage for EvalLmHarness {
     const NAME: &'static str = "eval_lm_harness";
-    const SCHEMA: u32 = 1;
+    // 2: stopped emitting synthetic scores; cached v1 reports are invalid.
+    const SCHEMA: u32 = 2;
     const RESOURCES: &'static [Resource] = &[Resource::Gpu, Resource::Network];
     // Tuple input: shares the (HfCheckpoint, DatasetJsonl) shape
     // with `eval_loss` + `eval_judge` so the `eval_suite` recipe
@@ -49,7 +53,7 @@ impl Stage for EvalLmHarness {
 
     async fn run(
         &self,
-        ctx: &StageContext,
+        _ctx: &StageContext,
         input: Self::Input,
         args: &Args,
     ) -> Result<EvalReport, StageError> {
@@ -61,41 +65,14 @@ impl Stage for EvalLmHarness {
                 "eval_lm_harness: tasks list must be non-empty".into(),
             ));
         }
-        let mut tasks_map = serde_json::Map::new();
-        let seed = ckpt.content_hash.0[1] as f32 / 255.0;
-        for (i, t) in args.tasks.iter().enumerate() {
-            // Synthetic deterministic score; real path parses harness output.
-            let score = 0.3 + (seed + i as f32 * 0.05) % 0.6;
-            tasks_map.insert(
-                t.clone(),
-                serde_json::json!({
-                    "acc": score,
-                    "n_fewshot": args.num_fewshot,
-                }),
-            );
-        }
-        let metrics = serde_json::json!({
-            "tasks": serde_json::Value::Object(tasks_map),
-            "synthetic": true,
-        });
-        let path = ctx.stage_dir.join("eval_lm_harness.json");
-        super::util::write_report(&path, &metrics)?;
-        let content_hash = ContentHash::hash_file(&path).map_err(|source| StageError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        Ok(EvalReport {
-            path,
-            evaluator: "eval_lm_harness".into(),
-            metrics,
-            content_hash,
-        })
+        Err(StageError::BadInput(NOT_IMPLEMENTED.into()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blut::framework::artifact::ContentHash;
     use std::path::PathBuf;
 
     fn ckpt() -> HfCheckpoint {
@@ -120,21 +97,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn produces_per_task_scores() {
+    async fn refuses_rather_than_inventing_scores() {
         let td = tempfile::tempdir().unwrap();
         let r = EvalLmHarness
             .run(
                 &ctx(td.path()),
                 (ckpt(), ds()),
                 &Args {
-                    tasks: vec!["hellaswag".into(), "arc_easy".into()],
+                    tasks: vec!["hellaswag".into()],
                     num_fewshot: 5,
                 },
             )
-            .await
-            .unwrap();
-        assert!(r.metrics["tasks"]["hellaswag"]["acc"].is_number());
-        assert!(r.metrics["tasks"]["arc_easy"]["acc"].is_number());
+            .await;
+        assert!(
+            matches!(&r, Err(StageError::BadInput(m)) if m.contains("not implemented")),
+            "got {r:?}"
+        );
     }
 
     #[tokio::test]

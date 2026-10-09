@@ -37,6 +37,7 @@ use crate::stages::*;
 impl<B: TrainingBackend> Compatible<B> for FilterDataset {}
 impl<B: TrainingBackend> Compatible<B> for SplitTrainEval {}
 impl<B: TrainingBackend> Compatible<B> for TakeTrain {}
+impl<B: TrainingBackend> Compatible<B> for TakeEval {}
 impl<B: TrainingBackend> Compatible<B> for MaterializeForEval {}
 impl<B: TrainingBackend> Compatible<B> for EvalLoss {}
 impl<B: TrainingBackend> Compatible<B> for EvalLmHarness {}
@@ -89,6 +90,7 @@ mod tests {
         _agnostic_witness::<FilterDataset>();
         _agnostic_witness::<SplitTrainEval>();
         _agnostic_witness::<TakeTrain>();
+        _agnostic_witness::<TakeEval>();
     }
 
     #[test]

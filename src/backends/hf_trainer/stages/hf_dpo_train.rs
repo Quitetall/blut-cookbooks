@@ -32,6 +32,18 @@ pub struct Args {
     pub seed: u64,
     #[serde(default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+    /// Processes (GPUs) per node. >1 runs DDP under torchrun.
+    #[serde(
+        default = "crate::distributed::one",
+        skip_serializing_if = "crate::distributed::is_one"
+    )]
+    pub nproc_per_node: u32,
+    /// Nodes in the job. >1 needs MASTER_ADDR and NODE_RANK on every node.
+    #[serde(
+        default = "crate::distributed::one",
+        skip_serializing_if = "crate::distributed::is_one"
+    )]
+    pub nnodes: u32,
 }
 
 fn default_batch() -> u32 {
@@ -56,6 +68,12 @@ impl Stage for HfDpoTrain {
     type Input = PreferenceJsonl;
     type Output = HfCheckpoint;
     type Args = Args;
+
+    /// One GPU permit per local rank, so the scheduler does not place other
+    /// GPU work on cards this job is using.
+    fn gpu_permits(&self, args: &Args) -> u32 {
+        args.nproc_per_node.max(1)
+    }
 
     async fn run(
         &self,
@@ -115,7 +133,8 @@ impl Stage for HfDpoTrain {
                 beta: args.beta,
                 preferences_path: None,
             }),
-            nproc_per_node: 1,
+            nproc_per_node: args.nproc_per_node,
+            nnodes: args.nnodes,
         };
 
         let status_tx = ctx.status_tx.clone();
@@ -209,6 +228,8 @@ mod tests {
                     seq_len: 1024,
                     seed: 42,
                     extra: serde_json::Map::new(),
+                    nproc_per_node: 1,
+                    nnodes: 1,
                 },
             )
             .await;
