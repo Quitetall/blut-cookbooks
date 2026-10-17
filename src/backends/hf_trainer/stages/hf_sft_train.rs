@@ -172,6 +172,7 @@ impl Stage for HfSftTrain {
             dpo: None,
             nproc_per_node: args.nproc_per_node,
             nnodes: args.nnodes,
+            launch_target: ctx.launch_target,
         };
 
         // Fan tqdm-style step events into the executor's status

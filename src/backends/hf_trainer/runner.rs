@@ -78,6 +78,10 @@ pub struct HfTrainerJob {
     /// the wrapper then also saves a checkpoint on each node.
     #[serde(default = "crate::distributed::one")]
     pub nnodes: u32,
+    /// Where the run is placed (`--launcher`). Not part of the spec the
+    /// wrapper reads: it decides how the wrapper is started, not what it does.
+    #[serde(skip)]
+    pub launch_target: blut::config::launcher::LaunchTarget,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -214,11 +218,21 @@ impl HfTrainerRunner {
         // one node or several. This gated on `nproc_per_node > 1` alone and
         // always passed `--standalone`, so a multi-node HF job could not be
         // expressed at all.
-        let prefix = crate::distributed::launch_prefix(job.nproc_per_node, job.nnodes)
-            .map_err(RunError::Launch)?;
-        let mut cmd = Command::new(&python);
-        cmd.args(&prefix);
-        cmd.arg(&wrapper).arg(&spec_path);
+        let inner = [
+            wrapper.display().to_string(),
+            spec_path.display().to_string(),
+        ];
+        let (program, argv) = crate::distributed::training_argv(
+            job.launch_target,
+            &python.display().to_string(),
+            job.nproc_per_node,
+            job.nnodes,
+            true,
+            &inner,
+        )
+        .map_err(RunError::Launch)?;
+        let mut cmd = Command::new(&program);
+        cmd.args(&argv);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -420,6 +434,7 @@ mod tests {
             dpo: None,
             nproc_per_node: 1,
             nnodes: 1,
+            launch_target: Default::default(),
         };
         let s = serde_json::to_string(&job).unwrap();
         let back: HfTrainerJob = serde_json::from_str(&s).unwrap();

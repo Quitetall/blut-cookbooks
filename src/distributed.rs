@@ -8,6 +8,8 @@
 //! overrides `--nnodes`), and it never passed `--node_rank` at all. One
 //! module now owns the decision so a fix lands everywhere at once.
 
+use blut::config::launcher::{LaunchTarget, Launcher as _, SlurmLauncher};
+
 /// Serde default for a process or node count: one.
 pub fn one() -> u32 {
     1
@@ -124,6 +126,106 @@ pub fn launch_prefix(nproc: u32, nnodes: u32) -> Result<Vec<String>, String> {
     Ok(torchrun_args(nproc, nnodes, rdzv.as_ref()).unwrap_or_default())
 }
 
+/// Shell run by every Slurm task: it resolves this node's rendezvous from the
+/// allocation and `exec`s `torchrun`. Rank and coordinator are per-node facts,
+/// so they cannot be computed by the process that calls `srun`: building
+/// `--node_rank` there handed every node the same rank. Positional arguments:
+/// `nnodes nproc python trainer-args...`.
+const SLURM_TORCHRUN: &str = r#"set -eu
+: "${SLURM_NODEID:?not running inside a Slurm step}"
+: "${SLURM_JOB_NODELIST:?not running inside a Slurm allocation}"
+nnodes=$1; nproc=$2; py=$3; shift 3
+addr=${MASTER_ADDR:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)}
+exec "$py" -m torch.distributed.run --nnodes "$nnodes" --nproc_per_node "$nproc" \
+  --rdzv_backend c10d --rdzv_endpoint "$addr:${MASTER_PORT:-29500}" \
+  --node_rank "$SLURM_NODEID" "$@""#;
+
+/// The program and arguments that run a training process where `target`
+/// says, for `nproc` processes on each of `nnodes` nodes. `inner` is
+/// everything after the interpreter (`-m blut_core.trainer --config …`).
+///
+/// A target this function cannot honor is an error, never a local run: a
+/// `--launcher slurm` request that quietly trained on the submitting host —
+/// which every training stage did — looks like success and is not one.
+pub fn training_argv(
+    target: LaunchTarget,
+    python: &str,
+    nproc: u32,
+    nnodes: u32,
+    gpus: bool,
+    inner: &[String],
+) -> Result<(String, Vec<String>), String> {
+    let (nproc, nnodes) = (nproc.max(1), nnodes.max(1));
+    match target {
+        LaunchTarget::Local => {
+            let mut argv = launch_prefix(nproc, nnodes)?;
+            argv.extend(inner.iter().cloned());
+            Ok((python.to_string(), argv))
+        }
+        LaunchTarget::Slurm => {
+            let mut task: Vec<String> = Vec::new();
+            if nproc * nnodes > 1 {
+                task.extend(["bash", "-c", SLURM_TORCHRUN, "blut-train"].map(String::from));
+                task.extend([nnodes.to_string(), nproc.to_string()]);
+            }
+            task.push(python.to_string());
+            task.extend(inner.iter().cloned());
+            let w = slurm_launcher(nproc, nnodes, gpus)?
+                .wrap("blut-train", &task)
+                .map_err(|e| format!("slurm launcher: {e}"))?;
+            Ok((w.program, w.args))
+        }
+        other => Err(format!(
+            "training cannot run under --launcher {other:?}: this stage supports \
+             `local` and `slurm`"
+        )),
+    }
+}
+
+/// `srun` placement for a training step: one task per node, because
+/// `torchrun` starts the `nproc` ranks itself. `BLUT_SLURM_*` supplies the
+/// site settings; a node or task count there that contradicts the stage's
+/// own is refused rather than letting one silently win.
+fn slurm_launcher(nproc: u32, nnodes: u32, gpus: bool) -> Result<SlurmLauncher, String> {
+    let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let env_u32 = |k: &str| -> Result<Option<u32>, String> {
+        env(k)
+            .map(|v| {
+                v.parse::<u32>()
+                    .map_err(|_| format!("{k}={v:?} is not a count"))
+            })
+            .transpose()
+    };
+    if let Some(n) = env_u32("BLUT_SLURM_NODES")?.filter(|&n| n != nnodes) {
+        return Err(format!(
+            "BLUT_SLURM_NODES={n} contradicts the stage's nnodes={nnodes}"
+        ));
+    }
+    if let Some(n) = env_u32("BLUT_SLURM_NTASKS_PER_NODE")?.filter(|&n| n != 1) {
+        return Err(format!(
+            "BLUT_SLURM_NTASKS_PER_NODE={n}: a training step runs one task per node \
+             (torchrun starts the {nproc} ranks); set nproc_per_node instead"
+        ));
+    }
+    // `--gpus` is a whole-job total in Slurm; an explicit site value is kept
+    // verbatim, otherwise each node asks for the GPUs its ranks will use.
+    let site_gpus = env_u32("BLUT_SLURM_GPUS")?;
+    let mut extra = Vec::new();
+    if gpus && site_gpus.is_none() {
+        extra.push(format!("--gpus-per-node={nproc}"));
+    }
+    Ok(SlurmLauncher {
+        partition: env("BLUT_SLURM_PARTITION"),
+        mem: env("BLUT_SLURM_MEM"),
+        cpus: env_u32("BLUT_SLURM_CPUS")?,
+        gpus: site_gpus,
+        time: env("BLUT_SLURM_TIME"),
+        nodes: Some(nnodes),
+        ntasks_per_node: Some(1),
+        extra,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +280,119 @@ mod tests {
         let rdzv = Rendezvous::new("10.0.0.1", "29500", "0");
         let args = torchrun_args(0, 2, Some(&rdzv)).expect("still two nodes");
         assert!(args.windows(2).any(|w| w == ["--nproc_per_node", "1"]));
+    }
+
+    fn inner() -> Vec<String> {
+        ["-m", "blut_core.trainer", "--config", "/shared/c.json"]
+            .map(String::from)
+            .to_vec()
+    }
+
+    fn slurm(nproc: u32, nnodes: u32) -> (String, Vec<String>) {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for k in [
+            "BLUT_SLURM_NODES",
+            "BLUT_SLURM_NTASKS_PER_NODE",
+            "BLUT_SLURM_GPUS",
+        ] {
+            // SAFETY: serialized by TEST_ENV_LOCK; no other thread reads env here.
+            unsafe { std::env::remove_var(k) };
+        }
+        training_argv(
+            LaunchTarget::Slurm,
+            "python3",
+            nproc,
+            nnodes,
+            true,
+            &inner(),
+        )
+        .unwrap()
+    }
+
+    /// The defect: `--launcher slurm` never reached a training stage, which
+    /// ran on the submitting host. A Slurm target must produce an `srun`.
+    #[test]
+    fn a_slurm_target_runs_the_trainer_through_srun() {
+        let (prog, args) = slurm(1, 1);
+        assert_eq!(prog, "srun");
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(
+            &args[sep + 1..],
+            [
+                "python3",
+                "-m",
+                "blut_core.trainer",
+                "--config",
+                "/shared/c.json"
+            ]
+        );
+        assert!(args.iter().any(|a| a == "--nodes=1"));
+        assert!(args.iter().any(|a| a == "--ntasks-per-node=1"));
+        assert!(args.iter().any(|a| a == "--gpus-per-node=1"));
+    }
+
+    /// Rank is decided on each node from `SLURM_NODEID`, never baked into the
+    /// command line by the submitter (which gave every node the same rank).
+    #[test]
+    fn multi_node_slurm_resolves_rank_on_each_node() {
+        let (prog, args) = slurm(2, 2);
+        assert_eq!(prog, "srun");
+        assert!(args.iter().any(|a| a == "--nodes=2"));
+        assert!(args.iter().any(|a| a == "--gpus-per-node=2"));
+        assert!(
+            !args.iter().any(|a| a == "--node_rank"),
+            "rank baked in: {args:?}"
+        );
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        let task = &args[sep + 1..];
+        assert_eq!(&task[..2], ["bash", "-c"]);
+        assert!(task[2].contains(r#"--node_rank "$SLURM_NODEID""#));
+        assert_eq!(&task[3..7], ["blut-train", "2", "2", "python3"]);
+        assert_eq!(&task[7..], inner().as_slice());
+    }
+
+    /// The task script must parse as shell and fail loudly outside a step.
+    #[test]
+    fn the_slurm_task_script_refuses_to_run_outside_an_allocation() {
+        let out = std::process::Command::new("bash")
+            .args(["-c", SLURM_TORCHRUN, "blut-train", "2", "1", "python3"])
+            .env_remove("SLURM_NODEID")
+            .output()
+            .expect("bash");
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not running inside a Slurm step"));
+    }
+
+    #[test]
+    fn a_contradicting_site_node_count_is_refused() {
+        let _g = crate::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: serialized by TEST_ENV_LOCK.
+        unsafe { std::env::set_var("BLUT_SLURM_NODES", "4") };
+        let r = training_argv(LaunchTarget::Slurm, "python3", 1, 2, true, &inner());
+        unsafe { std::env::remove_var("BLUT_SLURM_NODES") };
+        assert!(r.unwrap_err().contains("contradicts"));
+    }
+
+    #[test]
+    fn a_target_the_stage_cannot_honor_is_an_error_not_a_local_run() {
+        for t in [LaunchTarget::Ray, LaunchTarget::P2P] {
+            assert!(
+                training_argv(t, "python3", 1, 1, true, &inner()).is_err(),
+                "{t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_single_process_is_bare_python() {
+        let (prog, args) =
+            training_argv(LaunchTarget::Local, "python3", 1, 1, true, &inner()).unwrap();
+        assert_eq!(prog, "python3");
+        assert_eq!(args, inner());
     }
 
     #[test]
