@@ -107,3 +107,30 @@ def test_gpu_request_without_cuda_is_an_error_not_a_cpu_fallback(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="device: cpu"):
         trainer._ddp_device("cuda")
+
+
+def test_params_hash_changes_with_any_parameter_and_handles_bf16():
+    import torch
+
+    model = torch.nn.Linear(4, 3)
+    first = trainer._params_sha256(model)
+    assert first == trainer._params_sha256(model)
+    with torch.no_grad():
+        model.bias[0] += 1e-6
+    assert trainer._params_sha256(model) != first
+    assert len(trainer._params_sha256(model.to(torch.bfloat16))) == 64
+
+
+def test_diverged_replicas_fail_the_run(monkeypatch):
+    import pytest
+    import torch
+    import torch.distributed as dist
+
+    def gather(out, mine):
+        out[0], out[1] = mine, "f" * 64  # rank 1 holds different weights
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "0")
+    with pytest.raises(RuntimeError, match="replicas diverged"):
+        trainer._check_replicas_agree(torch.nn.Linear(2, 2))

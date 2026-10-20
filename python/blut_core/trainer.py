@@ -119,6 +119,36 @@ def _ddp_shard_dataset(dataset, batch_size: int, seed: int, dl_kwargs: dict = No
     return sampler, loader
 
 
+def _params_sha256(model) -> str:
+    """sha256 over every parameter and buffer, in name order, as raw bytes."""
+    import hashlib
+    import torch
+    h = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        h.update(name.encode())
+        # Reinterpret as bytes first: numpy has no bfloat16.
+        raw = tensor.detach().to("cpu").contiguous().view(-1).view(torch.uint8)
+        h.update(raw.numpy().tobytes())
+    return h.hexdigest()
+
+
+def _check_replicas_agree(model) -> str:
+    """DDP keeps one replica per rank and they must stay bit-identical. Every
+    rank hashes its parameters and rank 0 refuses to save if any differ, so a
+    replica that silently diverged (a skipped all-reduce, a rank that trained
+    on different data) fails the run instead of shipping one rank's weights."""
+    import torch.distributed as dist
+    mine = _params_sha256(model)
+    hashes = [None] * _ddp_world_size()
+    dist.all_gather_object(hashes, mine)
+    if len(set(hashes)) != 1:
+        raise RuntimeError(f"DDP replicas diverged; parameter sha256 per rank: {hashes}")
+    if _is_rank0():
+        print(f"[trainer] replicas agree across {len(hashes)} ranks: params sha256 {mine}")
+        return {"params_sha256": mine, "ranks": len(hashes)}
+    return None
+
+
 def _ddp_unwrap(model):
     """Unwrap DDP wrapper to get the base model."""
     return model.module if hasattr(model, 'module') else model
@@ -673,6 +703,10 @@ def train_loop(config: dict, ingredients: dict, dataset):
         base_model = _ddp_unwrap(model)  # identity for FSDP (no .module)
     else:
         base_model = _ddp_unwrap(model) if ddp else model
+        if ddp:
+            replica = _check_replicas_agree(base_model)  # collective; all ranks
+            if replica is not None:
+                emit(replica, kind="replicas")
         model_state = base_model.state_dict() if _is_rank0() else None
 
     if _is_rank0():
