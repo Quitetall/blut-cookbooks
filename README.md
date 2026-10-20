@@ -38,7 +38,7 @@ loss.
 
 ```sh
 blut-core recipe run train_from_dataset --args '{
-  "hf_name": "wikitext", "subset": "wikitext-2-raw-v1", "max_samples": 2000,
+  "hf_name": "Salesforce/wikitext", "subset": "wikitext-2-raw-v1", "max_samples": 2000,
   "model":     {"kind": "model", "name": "from_pretrained",
                 "config": {"model_name": "HuggingFaceTB/SmolLM2-135M"}},
   "optimizer": {"kind": "optimizer", "name": "adamw", "config": {"lr": 1e-4}},
