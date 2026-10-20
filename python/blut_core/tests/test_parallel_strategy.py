@@ -79,5 +79,31 @@ def test_ddp_init_selects_the_local_rank_device(monkeypatch):
     monkeypatch.setenv("LOCAL_RANK", "1")
     monkeypatch.setenv("RANK", "3")
     monkeypatch.setenv("WORLD_SIZE", "4")
-    trainer._ddp_init()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert trainer._ddp_init() == "cuda:1"
     assert calls == {"backend": "nccl", "device": 1}
+
+
+def test_cpu_ranks_use_gloo_and_never_touch_cuda(monkeypatch):
+    """`device: cpu` under DDP used to call init_process_group("nccl") and
+    torch.cuda.set_device, so CPU-only multi-node training could not start."""
+    import torch
+    import torch.distributed as dist
+
+    calls = {}
+    monkeypatch.setattr(dist, "init_process_group", lambda backend: calls.update(backend=backend))
+    monkeypatch.setattr(torch.cuda, "set_device", lambda i: calls.update(device=i))
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    assert trainer._ddp_init("cpu") == "cpu"
+    assert calls == {"backend": "gloo"}
+
+
+def test_gpu_request_without_cuda_is_an_error_not_a_cpu_fallback(monkeypatch):
+    import pytest
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="device: cpu"):
+        trainer._ddp_device("cuda")
