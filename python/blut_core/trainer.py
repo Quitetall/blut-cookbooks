@@ -57,6 +57,9 @@ def _is_rank0() -> bool:
 
 def _ddp_init():
     """Initialize the DDP process group (NCCL backend)."""
+    # `import torch.distributed as dist` binds only `dist`; `torch` itself
+    # must be imported here too, since this module imports it lazily.
+    import torch
     import torch.distributed as dist
     dist.init_process_group(backend="nccl")
     local_rank = _ddp_local_rank()

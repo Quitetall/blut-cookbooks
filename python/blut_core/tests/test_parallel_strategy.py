@@ -62,3 +62,22 @@ def test_ddp_unwrap_is_identity_for_plain_model():
     """FSDP models have no `.module`; unwrap must return them unchanged."""
     sentinel = object()
     assert trainer._ddp_unwrap(sentinel) is sentinel
+
+
+# --- _ddp_init: the process group comes up and the rank's device is selected --
+
+def test_ddp_init_selects_the_local_rank_device(monkeypatch):
+    """Every distributed run went through `_ddp_init`, which raised
+    NameError: name 'torch' is not defined. Observed on a two-node Slurm run;
+    nothing here had ever executed it."""
+    import torch
+    import torch.distributed as dist
+
+    calls = {}
+    monkeypatch.setattr(dist, "init_process_group", lambda backend: calls.update(backend=backend))
+    monkeypatch.setattr(torch.cuda, "set_device", lambda i: calls.update(device=i))
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setenv("RANK", "3")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    trainer._ddp_init()
+    assert calls == {"backend": "nccl", "device": 1}
