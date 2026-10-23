@@ -55,14 +55,37 @@ def _is_rank0() -> bool:
     return _ddp_rank() == 0
 
 
-def _ddp_init():
-    """Initialize the DDP process group (NCCL backend)."""
+def _ddp_device(device: str) -> str:
+    """The device this rank trains on: its local GPU, or the CPU when the
+    config asks for `device: cpu`. A GPU request on a host without CUDA is an
+    error, not a silent move to the CPU."""
+    import torch
+    if device == "cpu":
+        return "cpu"
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"device={device!r} needs CUDA, which is not available on this host; "
+            "set `device: cpu` to train on the CPU (gloo backend)")
+    return f"cuda:{_ddp_local_rank()}"
+
+
+def _ddp_init(device: str = "cuda"):
+    """Initialize the process group: NCCL for GPU ranks, gloo for CPU ranks
+    (NCCL has no CPU transport)."""
+    # `import torch.distributed as dist` binds only `dist`; `torch` itself
+    # must be imported here too, since this module imports it lazily.
+    import torch
     import torch.distributed as dist
-    dist.init_process_group(backend="nccl")
+    rank_device = _ddp_device(device)
+    on_gpu = rank_device.startswith("cuda")
+    dist.init_process_group(backend="nccl" if on_gpu else "gloo")
     local_rank = _ddp_local_rank()
-    torch.cuda.set_device(local_rank)
+    if on_gpu:
+        torch.cuda.set_device(local_rank)
     print(f"[trainer] DDP initialized: rank={_ddp_rank()}, "
-          f"local_rank={local_rank}, world_size={_ddp_world_size()}")
+          f"local_rank={local_rank}, world_size={_ddp_world_size()}, "
+          f"device={rank_device}")
+    return rank_device
 
 
 def _ddp_cleanup():
@@ -72,14 +95,16 @@ def _ddp_cleanup():
         dist.destroy_process_group()
 
 
-def _ddp_wrap_model(model):
-    """Wrap model with DistributedDataParallel."""
+def _ddp_wrap_model(model, rank_device: str = None):
+    """Wrap model with DistributedDataParallel on this rank's device."""
     import torch.nn.parallel as parallel
     local_rank = _ddp_local_rank()
-    model = model.to(f"cuda:{local_rank}")
-    model = parallel.DistributedDataParallel(
-        model, device_ids=[local_rank], output_device=local_rank)
-    return model
+    rank_device = rank_device or f"cuda:{local_rank}"
+    model = model.to(rank_device)
+    if rank_device.startswith("cuda"):
+        return parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank)
+    return parallel.DistributedDataParallel(model)
 
 
 def _ddp_shard_dataset(dataset, batch_size: int, seed: int, dl_kwargs: dict = None):
@@ -92,6 +117,36 @@ def _ddp_shard_dataset(dataset, batch_size: int, seed: int, dl_kwargs: dict = No
     sampler = DistributedSampler(dataset, seed=seed, shuffle=True)
     loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, **dl_kwargs)
     return sampler, loader
+
+
+def _params_sha256(model) -> str:
+    """sha256 over every parameter and buffer, in name order, as raw bytes."""
+    import hashlib
+    import torch
+    h = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        h.update(name.encode())
+        # Reinterpret as bytes first: numpy has no bfloat16.
+        raw = tensor.detach().to("cpu").contiguous().view(-1).view(torch.uint8)
+        h.update(raw.numpy().tobytes())
+    return h.hexdigest()
+
+
+def _check_replicas_agree(model) -> str:
+    """DDP keeps one replica per rank and they must stay bit-identical. Every
+    rank hashes its parameters and rank 0 refuses to save if any differ, so a
+    replica that silently diverged (a skipped all-reduce, a rank that trained
+    on different data) fails the run instead of shipping one rank's weights."""
+    import torch.distributed as dist
+    mine = _params_sha256(model)
+    hashes = [None] * _ddp_world_size()
+    dist.all_gather_object(hashes, mine)
+    if len(set(hashes)) != 1:
+        raise RuntimeError(f"DDP replicas diverged; parameter sha256 per rank: {hashes}")
+    if _is_rank0():
+        print(f"[trainer] replicas agree across {len(hashes)} ranks: params sha256 {mine}")
+        return {"params_sha256": mine, "ranks": len(hashes)}
+    return None
 
 
 def _ddp_unwrap(model):
@@ -512,14 +567,16 @@ def train_loop(config: dict, ingredients: dict, dataset):
     ddp = _is_ddp()
     strategy = _parallel_strategy(config) if ddp else "ddp"
     if ddp:
-        _ddp_init()
+        rank_device = _ddp_init(device)
+        if strategy == "fsdp" and not rank_device.startswith("cuda"):
+            raise RuntimeError("parallel_strategy=fsdp needs CUDA; use ddp on the CPU")
         # Wrap the model per strategy. Both wraps move it to the local GPU;
         # the data-parallel axis (DistributedSampler + loss all-reduce) is
         # identical — FSDP shards params, not the data dimension.
         if strategy == "fsdp":
             model = _fsdp_wrap_model(model)
         else:
-            model = _ddp_wrap_model(model)
+            model = _ddp_wrap_model(model, rank_device)
         # Create output dir (rank 0 only)
         if _is_rank0():
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -586,7 +643,7 @@ def train_loop(config: dict, ingredients: dict, dataset):
         # checkpoint, and exited 0. A failed batch now fails the run. Under
         # DDP that is also the only safe choice: a rank that skips a batch
         # its peers train on deadlocks the next gradient all-reduce.
-        target_device = (f"cuda:{_ddp_local_rank()}" if ddp
+        target_device = (rank_device if ddp
                          else ("cpu" if device == "cpu" else device))
         # Losses accumulate on the device. `.item()` per batch forces a
         # host-device sync every step, stalling the queue of launched kernels
@@ -621,9 +678,10 @@ def train_loop(config: dict, ingredients: dict, dataset):
         # Reduce avg_loss across DDP ranks for consistent reporting
         if ddp:
             import torch.distributed as dist
-            loss_tensor = torch.tensor([avg_loss], device=f"cuda:{_ddp_local_rank()}")
-            dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
-            avg_loss = loss_tensor.item()
+            # SUM then divide: gloo (the CPU backend) has no AVG reduction.
+            loss_tensor = torch.tensor([avg_loss], device=rank_device)
+            dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
+            avg_loss = loss_tensor.item() / _ddp_world_size()
 
         # Emit metrics (rank 0 only)
         if _is_rank0():
@@ -645,6 +703,10 @@ def train_loop(config: dict, ingredients: dict, dataset):
         base_model = _ddp_unwrap(model)  # identity for FSDP (no .module)
     else:
         base_model = _ddp_unwrap(model) if ddp else model
+        if ddp:
+            replica = _check_replicas_agree(base_model)  # collective; all ranks
+            if replica is not None:
+                emit(replica, kind="replicas")
         model_state = base_model.state_dict() if _is_rank0() else None
 
     if _is_rank0():

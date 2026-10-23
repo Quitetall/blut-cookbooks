@@ -17,7 +17,8 @@ use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
 
 use super::shared::IngredientCfg;
-use blut_backends::distributed::{Rendezvous, torchrun_args};
+use blut::config::launcher::LaunchTarget;
+use blut_backends::distributed::training_argv;
 
 pub struct TrainModel;
 
@@ -195,24 +196,28 @@ impl Stage for TrainModel {
             },
         )?;
 
-        // Invoke the generic trainer (via torchrun when the run is distributed)
+        // Invoke the generic trainer where `--launcher` placed it: locally
+        // (via torchrun when distributed) or as a Slurm step.
         let nproc = args.nproc_per_node.max(1);
         let nnodes = args.nnodes.max(1);
-        let rdzv = if nnodes > 1 {
-            Some(Rendezvous::from_env().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?)
-        } else {
-            None
-        };
-        let mut cmd = std::process::Command::new("python3");
-        if let Some(launch) = torchrun_args(nproc, nnodes, rdzv.as_ref()) {
-            cmd.args(&launch);
-        }
-        cmd.args([
+        let inner = [
             "-m",
             "blut_core.trainer",
             "--config",
             config_path.to_str().unwrap(),
-        ]);
+        ]
+        .map(String::from);
+        let (program, argv) = training_argv(
+            ctx.launch_target,
+            "python3",
+            nproc,
+            nnodes,
+            args.device != "cpu",
+            &inner,
+        )
+        .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(&argv);
         cmd.current_dir(&ctx.stage_dir);
 
         // Pin only when this node runs a single process. With several local
@@ -220,7 +225,8 @@ impl Stage for TrainModel {
         // collapse every rank onto one card. One rank per node (the usual
         // multi-node shape) still pins: LOCAL_RANK is 0 there, so device 0
         // must be the card the scheduler actually granted.
-        if nproc <= 1 {
+        // Under Slurm the allocation assigns devices, so only a local run pins.
+        if nproc <= 1 && ctx.launch_target == LaunchTarget::Local {
             if let Some(dev) = ctx.device_index {
                 cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
             }
