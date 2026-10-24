@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use blut::artifacts::DatasetJsonl;
+use blut::config::launcher::LaunchTarget;
 use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
@@ -87,27 +88,39 @@ impl Stage for LoadDataset {
             (None, Some(hf_name)) => {
                 // HuggingFace dataset — download and convert to JSONL
                 let output_path = ctx.stage_dir.join("dataset.jsonl");
-                let mut cmd = std::process::Command::new("python3");
-                cmd.args([
-                    "-m",
-                    "blut_core.load_dataset",
-                    "--name",
-                    hf_name,
-                    "--split",
-                    &args.split,
-                    "--output",
-                    output_path.to_str().unwrap(),
-                ]);
+                let mut cmdline = vec![
+                    blut_backends::local_stage::python(),
+                    "-m".to_string(),
+                    "blut_core.load_dataset".to_string(),
+                    "--name".to_string(),
+                    hf_name.clone(),
+                    "--split".to_string(),
+                    args.split.clone(),
+                    "--output".to_string(),
+                    output_path.display().to_string(),
+                ];
                 if let Some(subset) = &args.subset {
-                    cmd.args(["--subset", subset]);
+                    cmdline.extend(["--subset".to_string(), subset.clone()]);
                 }
                 if let Some(max) = args.max_samples {
-                    cmd.args(["--max-samples", &max.to_string()]);
+                    cmdline.extend(["--max-samples".to_string(), max.to_string()]);
                 }
-                let status = cmd.status().map_err(|e| {
-                    StageError::Backend(anyhow::anyhow!(
+                // A local helper process wherever the recipe trains, so
+                // contained as a local one (on Windows); see local_stage.
+                let status = blut_backends::local_stage::run(
+                    ctx,
+                    LaunchTarget::Local,
+                    "blut-load_dataset",
+                    &cmdline,
+                    None,
+                    &[],
+                )
+                .await
+                .map_err(|e| match e {
+                    StageError::Backend(e) => StageError::Backend(anyhow::anyhow!(
                         "failed to run blut_core.load_dataset: {e}"
-                    ))
+                    )),
+                    other => other,
                 })?;
                 if !status.success() {
                     return Err(StageError::Backend(anyhow::anyhow!(

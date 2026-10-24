@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::oneshot;
 
 use crate::backend::{StatusFn, TrainArtifact, TrainBackend};
@@ -101,14 +100,13 @@ impl TrainBackend for PythonTrainBackend {
         use blut::config::launcher::{LaunchTarget, launcher_for};
         let nproc = spec.nproc_per_node.max(1);
         let nnodes = spec.nnodes.max(1);
-        let mut cmd = match self.launch_target {
+        let (cmdline, mut env) = match self.launch_target {
             LaunchTarget::Local => {
-                let mut c = Command::new(&self.python);
-                for arg in launch_prefix(nproc, nnodes).map_err(TrainError::other)? {
-                    c.arg(arg);
-                }
-                c.arg(&self.trainer_script).arg(&spec_json);
-                c
+                let mut c = vec![self.python.display().to_string()];
+                c.extend(launch_prefix(nproc, nnodes).map_err(TrainError::other)?);
+                c.push(self.trainer_script.display().to_string());
+                c.push(spec_json.clone());
+                (c, Vec::new())
             }
             target => {
                 let mut inner_args =
@@ -131,41 +129,46 @@ impl TrainBackend for PythonTrainBackend {
                 let w = launcher_for(target)
                     .wrap("blut-train", &full_inner)
                     .map_err(|e| TrainError::other(format!("launcher wrap: {e}")))?;
-                let mut c = Command::new(&w.program);
-                c.args(&w.args);
-                for (k, v) in &w.env {
-                    c.env(k, v);
-                }
-                c
+                let mut c = vec![w.program];
+                c.extend(w.args);
+                (c, w.env)
             }
         };
         // For DDP: don't pin CUDA_VISIBLE_DEVICES — torchrun manages LOCAL_RANK
-        if nproc <= 1 {
-            // Single-GPU: could pin device here if needed
-        }
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // KILL-1: new session/process group so cancel can killpg the
-        // whole tree (DataLoader workers, torchrun ranks) — not just
-        // this direct child.
-        #[cfg(unix)]
-        {
-            // tokio::process::Command exposes `pre_exec` inherently
-            // (no std CommandExt import needed).
-            // SAFETY: setsid is async-signal-safe; pre_exec_setsid
-            // allocates nothing. Sound to run between fork and exec.
-            #[allow(unsafe_code)]
-            unsafe {
-                cmd.pre_exec(blut::python_kill::pre_exec_setsid);
-            }
-        }
+        env.extend(self.env.iter().cloned());
 
-        let mut child = cmd.spawn().map_err(|e| {
+        // Contained on Windows for a local run (memory cap, peak, tree kill;
+        // the tree also dies if this future is dropped); see
+        // crate::local_stage.
+        let mut child = crate::local_stage::spawn(
+            self.launch_target,
+            "blut-lamu_trainer",
+            &cmdline,
+            None,
+            &env,
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                // KILL-1: new session/process group so cancel can killpg the
+                // whole tree (DataLoader workers, torchrun ranks) — not just
+                // this direct child.
+                #[cfg(unix)]
+                {
+                    // tokio::process::Command exposes `pre_exec` inherently
+                    // (no std CommandExt import needed).
+                    // SAFETY: setsid is async-signal-safe; pre_exec_setsid
+                    // allocates nothing. Sound to run between fork and exec.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        cmd.pre_exec(blut::python_kill::pre_exec_setsid);
+                    }
+                }
+            },
+        )
+        .await
+        .map_err(|e| {
             TrainError::Trainer(format!(
                 "spawn {} {}: {}",
                 self.python.display(),
@@ -181,14 +184,14 @@ impl TrainBackend for PythonTrainBackend {
             blut::python_kill::register_child(blut::python_kill::capture_identity(pid));
         }
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| TrainError::Trainer("trainer subprocess stdout pipe missing".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| TrainError::Trainer("trainer subprocess stderr pipe missing".into()))?;
+        let stdout =
+            child.child_mut().stdout.take().ok_or_else(|| {
+                TrainError::Trainer("trainer subprocess stdout pipe missing".into())
+            })?;
+        let stderr =
+            child.child_mut().stderr.take().ok_or_else(|| {
+                TrainError::Trainer("trainer subprocess stderr pipe missing".into())
+            })?;
 
         let (artifact_tx, artifact_rx) = oneshot::channel();
         let started = Instant::now();
@@ -262,10 +265,15 @@ impl TrainBackend for PythonTrainBackend {
         // D3 watchdog task (only when configured). Ticks at min(timeout/4,
         // 30s); on idle > timeout it SIGTERMs the child group and records
         // a reason. Aborted below once the child exits.
+        // Fired by the watchdog after its group kill: the contained wait
+        // below then kills the whole tree through the containment backend,
+        // which is the only tree kill on Windows (no process groups there).
+        let watchdog_kill = tokio_util::sync::CancellationToken::new();
         let watchdog = self.liveness_timeout.map(|timeout| {
             let activity = Arc::clone(&last_activity);
             let pid_handle = Arc::clone(&self.child_pid);
             let reason = Arc::clone(&watchdog_reason);
+            let kill = watchdog_kill.clone();
             tokio::spawn(async move {
                 let tick = std::cmp::min(timeout / 4, Duration::from_secs(30))
                     .max(Duration::from_millis(100));
@@ -294,13 +302,15 @@ impl TrainBackend for PythonTrainBackend {
                             "liveness watchdog: idle {idle:?} but no child pid to kill"
                         ),
                     }
+                    kill.cancel();
                     return;
                 }
             })
         });
 
+        // `None`: the watchdog fired and the tree was killed.
         let exit_status = child
-            .wait()
+            .wait_or_cancel(&watchdog_kill)
             .await
             .map_err(|e| TrainError::Trainer(format!("wait for trainer.py: {e}")))?;
 
@@ -333,6 +343,9 @@ impl TrainBackend for PythonTrainBackend {
         if let Some(error) = last_failed {
             return Err(TrainError::Trainer(error));
         }
+        let exit_status = exit_status.ok_or_else(|| {
+            TrainError::Trainer("trainer.py was killed by the liveness watchdog".into())
+        })?;
         if !exit_status.success() {
             return Err(TrainError::Trainer(format!(
                 "trainer.py exited with {exit_status} and emitted no Failed status"

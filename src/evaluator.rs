@@ -8,6 +8,7 @@
 use std::path::Path;
 
 use blut::artifacts::EvalReport;
+use blut::config::launcher::LaunchTarget;
 use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::stage::StageContext;
@@ -38,7 +39,7 @@ pub struct EvalRequest<'a> {
 /// `evaluator` names the report's producer (the `EvalReport::evaluator`
 /// field). Every failure is a stage error: a report is only returned when the
 /// evaluator exited cleanly and wrote one.
-pub fn run_evaluator(
+pub async fn run_evaluator(
     ctx: &StageContext,
     req: &EvalRequest<'_>,
     evaluator: &str,
@@ -74,18 +75,31 @@ pub fn run_evaluator(
     })?;
 
     let output_path = ctx.stage_dir.join("eval_report.json");
-    let status = std::process::Command::new("python3")
-        .args(["-m", "blut_core.evaluator", "--config"])
-        .arg(&config_path)
-        .arg("--output")
-        .arg(&output_path)
-        .current_dir(&ctx.stage_dir)
-        .status()
-        .map_err(|error| {
-            StageError::Backend(anyhow::anyhow!(
-                "failed to run blut_core.evaluator: {error}"
-            ))
-        })?;
+    let cmdline = vec![
+        crate::local_stage::python(),
+        "-m".to_string(),
+        "blut_core.evaluator".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+        "--output".to_string(),
+        output_path.display().to_string(),
+    ];
+    // Contained on Windows (memory cap, peak, tree kill); see local_stage.
+    let status = crate::local_stage::run(
+        ctx,
+        LaunchTarget::Local,
+        "blut-evaluator",
+        &cmdline,
+        Some(&ctx.stage_dir),
+        &[],
+    )
+    .await
+    .map_err(|e| match e {
+        StageError::Backend(error) => StageError::Backend(anyhow::anyhow!(
+            "failed to run blut_core.evaluator: {error}"
+        )),
+        other => other,
+    })?;
     if !status.success() {
         return Err(StageError::Backend(anyhow::anyhow!(
             "blut_core.evaluator exited with {status}"

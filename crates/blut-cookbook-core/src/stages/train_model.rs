@@ -207,18 +207,18 @@ impl Stage for TrainModel {
             config_path.to_str().unwrap(),
         ]
         .map(String::from);
+        let python = blut_backends::local_stage::python();
         let (program, argv) = training_argv(
             ctx.launch_target,
-            "python3",
+            &python,
             nproc,
             nnodes,
             args.device != "cpu",
             &inner,
         )
         .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-        let mut cmd = std::process::Command::new(program);
-        cmd.args(&argv);
-        cmd.current_dir(&ctx.stage_dir);
+        let mut cmdline = vec![program];
+        cmdline.extend(argv);
 
         // Pin only when this node runs a single process. With several local
         // ranks torchrun assigns devices through LOCAL_RANK and a pin would
@@ -226,14 +226,28 @@ impl Stage for TrainModel {
         // multi-node shape) still pins: LOCAL_RANK is 0 there, so device 0
         // must be the card the scheduler actually granted.
         // Under Slurm the allocation assigns devices, so only a local run pins.
+        let mut env = Vec::new();
         if nproc <= 1 && ctx.launch_target == LaunchTarget::Local {
             if let Some(dev) = ctx.device_index {
-                cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
+                env.push(("CUDA_VISIBLE_DEVICES".to_string(), dev.to_string()));
             }
         }
 
-        let status = cmd.status().map_err(|e| {
-            StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {e}"))
+        // Contained on Windows (memory cap, peak, tree kill); see local_stage.
+        let status = blut_backends::local_stage::run(
+            ctx,
+            ctx.launch_target,
+            "blut-train_model",
+            &cmdline,
+            Some(&ctx.stage_dir),
+            &env,
+        )
+        .await
+        .map_err(|e| match e {
+            StageError::Backend(e) => {
+                StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {e}"))
+            }
+            other => other,
         })?;
 
         if !status.success() {

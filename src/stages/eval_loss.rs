@@ -81,7 +81,8 @@ impl Stage for EvalLoss {
                 max_seq_len: Some(args.max_seq),
             },
             "eval_loss",
-        )?;
+        )
+        .await?;
         if let Some(metrics) = report.metrics.as_object_mut() {
             metrics.insert("n_examples".into(), ds.n_examples.into());
         }

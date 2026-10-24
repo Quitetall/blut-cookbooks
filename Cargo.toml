@@ -55,7 +55,7 @@ distributed = ["cloud", "raft"]
 # Production builds resolve the exact reviewed BLUT owner commit. LamQuant's
 # editable bootstrap may override this source locally, but published manifests
 # never depend on a sibling checkout.
-blut = { version = "=0.2.0-alpha.1", default-features = false }
+blut = { version = "=0.2.0-alpha.2", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -64,6 +64,9 @@ thiserror = "1"
 anyhow = "1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
+# CancellationToken, for the trainer watchdog's contained tree kill. Already
+# in the graph through blut.
+tokio-util = "0.7"
 tracing = "0.1"
 parking_lot = "0.12"
 nix = { version = "0.29", features = ["signal", "process"] }

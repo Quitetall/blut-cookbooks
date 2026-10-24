@@ -41,6 +41,7 @@ pub mod conversations;
 pub mod convert;
 pub mod distributed;
 pub mod evaluator;
+pub mod local_stage;
 pub mod stages;
 
 /// Process-wide lock for tests that mutate environment variables.

@@ -17,9 +17,18 @@
 
 use std::path::{Path, PathBuf};
 
-use tokio::process::Command;
-
+use blut::config::launcher::LaunchTarget;
 use blut::error::{Result, TrainError};
+
+/// Run one conversion tool to completion with inherited stdio, contained on
+/// Windows (see [`crate::local_stage`]). The child dies with this future.
+async fn run_tool(unit: &str, cmdline: &[String]) -> Result<std::process::ExitStatus> {
+    let mut child = crate::local_stage::spawn(LaunchTarget::Local, unit, cmdline, None, &[], |c| {
+        c.kill_on_drop(true);
+    })
+    .await?;
+    child.wait().await
+}
 
 /// Run the HF → GGUF pipeline. Returns the final on-disk path
 /// (quantized GGUF if `quant != "f16"`, otherwise the f16 GGUF).
@@ -53,14 +62,19 @@ pub async fn convert_to_gguf(checkpoint_dir: &Path, name: &str, quant: &str) -> 
     let convert = blut::config::llama_tool("convert_hf_to_gguf.py")
         .map_err(|e| TrainError::Convert(format!("locate convert_hf_to_gguf.py: {e}")))?;
 
-    let convert_status = Command::new("python3")
-        .arg(&convert)
-        .arg(checkpoint_dir)
-        .arg("--outfile")
-        .arg(&f16_path)
-        .status()
-        .await
-        .map_err(|e| TrainError::Convert(format!("spawn python3 {}: {e}", convert.display())))?;
+    let python = crate::local_stage::python();
+    let convert_status = run_tool(
+        "blut-convert_hf_to_gguf",
+        &[
+            python.clone(),
+            convert.display().to_string(),
+            checkpoint_dir.display().to_string(),
+            "--outfile".to_string(),
+            f16_path.display().to_string(),
+        ],
+    )
+    .await
+    .map_err(|e| TrainError::Convert(format!("spawn {python} {}: {e}", convert.display())))?;
     if !convert_status.success() {
         return Err(TrainError::Convert(format!(
             "convert_hf_to_gguf.py exited with {convert_status}"
@@ -80,13 +94,17 @@ pub async fn convert_to_gguf(checkpoint_dir: &Path, name: &str, quant: &str) -> 
     let quantize = blut::config::llama_tool("llama-quantize")
         .map_err(|e| TrainError::Convert(format!("locate llama-quantize: {e}")))?;
     let q_path = parent.join(format!("{name}.{quant}.gguf"));
-    let q_status = Command::new(&quantize)
-        .arg(&f16_path)
-        .arg(&q_path)
-        .arg(quant)
-        .status()
-        .await
-        .map_err(|e| TrainError::Convert(format!("spawn {}: {e}", quantize.display())))?;
+    let q_status = run_tool(
+        "blut-llama-quantize",
+        &[
+            quantize.display().to_string(),
+            f16_path.display().to_string(),
+            q_path.display().to_string(),
+            quant.to_string(),
+        ],
+    )
+    .await
+    .map_err(|e| TrainError::Convert(format!("spawn {}: {e}", quantize.display())))?;
     if !q_status.success() {
         return Err(TrainError::Convert(format!(
             "llama-quantize exited with {q_status}; \

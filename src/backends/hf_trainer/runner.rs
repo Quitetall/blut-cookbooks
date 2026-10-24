@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 
 use blut::python_kill::graceful_kill_pid;
 
@@ -231,26 +230,38 @@ impl HfTrainerRunner {
             &inner,
         )
         .map_err(RunError::Launch)?;
-        let mut cmd = Command::new(&program);
-        cmd.args(&argv);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // KILL-1: new session/process group — see python_kill::pre_exec_setsid.
-        #[cfg(unix)]
-        {
-            // tokio's Command exposes `pre_exec` inherently.
-            // SAFETY: setsid is async-signal-safe and allocates nothing.
-            #[allow(unsafe_code)]
-            unsafe {
-                cmd.pre_exec(blut::python_kill::pre_exec_setsid);
-            }
-        }
-
-        let mut child = cmd.spawn().map_err(|source| RunError::Spawn {
+        let mut cmdline = vec![program];
+        cmdline.extend(argv);
+        // Contained on Windows for a local run (memory cap, peak, tree
+        // kill; the tree also dies if this future is dropped); see
+        // crate::local_stage.
+        let mut child = crate::local_stage::spawn(
+            job.launch_target,
+            "blut-hf_trainer",
+            &cmdline,
+            None,
+            &[],
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+                // KILL-1: new session/process group — see python_kill::pre_exec_setsid.
+                #[cfg(unix)]
+                {
+                    // tokio's Command exposes `pre_exec` inherently.
+                    // SAFETY: setsid is async-signal-safe and allocates nothing.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        cmd.pre_exec(blut::python_kill::pre_exec_setsid);
+                    }
+                }
+            },
+        )
+        .await
+        .map_err(|e| RunError::Spawn {
             python: python.display().to_string(),
-            source,
+            source: crate::local_stage::spawn_error_to_io(e),
         })?;
         if let Some(pid) = child.id() {
             *self.child_pid.lock() = Some(pid);
@@ -259,8 +270,8 @@ impl HfTrainerRunner {
         }
 
         let started = Instant::now();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdout = child.child_mut().stdout.take();
+        let stderr = child.child_mut().stderr.take();
         let on_status: Arc<dyn Fn(StatusLine) + Send + Sync> = Arc::from(on_status);
         let collected: Arc<Mutex<(Option<HfRunArtifact>, Option<String>)>> =
             Arc::new(Mutex::new((None, None)));
@@ -316,9 +327,9 @@ impl HfTrainerRunner {
             })
         });
 
-        let exit = child.wait().await.map_err(|source| RunError::Io {
+        let exit = child.wait().await.map_err(|e| RunError::Io {
             path: PathBuf::from("hf-trainer-wait"),
-            source,
+            source: std::io::Error::other(e.to_string()),
         })?;
         if let Some(h) = stdout_handle
             && let Err(e) = h.await

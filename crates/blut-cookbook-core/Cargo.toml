@@ -23,7 +23,7 @@ name = "blut-core"
 path = "src/main.rs"
 
 [dependencies]
-blut = { version = "=0.2.0-alpha.1", default-features = false }
+blut = { version = "=0.2.0-alpha.2", default-features = false }
 blut-backends = { package = "blut-cookbook-standard", path = "../..", version = "=0.2.0" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"

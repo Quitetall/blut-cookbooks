@@ -1,0 +1,101 @@
+# Windows containment, end to end: build blut-core against a pinned engine
+# commit on a real Windows Server VM, train a tiny CPU model through BLUT, and
+# check from outside that every stage process ran in a Job Object (attached,
+# capped, peak reported) and that a stage timeout and the driver's death each
+# kill the whole training tree. tests/windows_e2e/run.py holds the checks.
+#
+# The engine is checked out at BLUT_ENGINE_REV and patched in for crates.io's
+# `blut`, because this cookbook pins an engine release that is not published
+# yet. Once it is, drop the engine checkout and the patch, and the job tests
+# the published engine instead. Every action is pinned by commit SHA.
+name: windows-containment
+on:
+  push:
+    branches: [main, "agent/windows-**"]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "python/**"
+      - "tests/windows_e2e/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-containment.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "crates/**"
+      - "python/**"
+      - "tests/windows_e2e/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-containment.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+env:
+  CARGO_TERM_COLOR: always
+  # The engine commit under test (Quitetall/blut, branch agent/windows-local).
+  BLUT_ENGINE_REV: ce98a580fa7081557bd678b128021e712cc6aef4
+  PYTHONUTF8: "1"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+jobs:
+  e2e:
+    name: train through BLUT in a Job Object (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: cookbooks
+    steps:
+      # Side by side, not nested: the engine is its own Cargo workspace and
+      # must not sit inside this one.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: cookbooks
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: Quitetall/blut
+          ref: ${{ env.BLUT_ENGINE_REV }}
+          path: engine
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: "1.88"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: cookbooks -> target
+      - name: Patch crates.io blut with the engine checkout
+        shell: bash
+        run: |
+          engine="$(cygpath -m "$GITHUB_WORKSPACE/engine")"
+          mkdir -p .cargo
+          printf '[patch.crates-io]\nblut = { path = "%s" }\n' "$engine" > .cargo/config.toml
+          cat .cargo/config.toml
+      - name: Build blut-core
+        run: cargo build -p blut-cookbook-core --bin blut-core
+      - name: Install CPU torch and transformers
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install transformers psutil
+      - name: Train, time out, and kill the driver, in Job Objects
+        shell: bash
+        run: >-
+          python tests/windows_e2e/run.py
+          --blut target/debug/blut-core.exe
+          --work "$RUNNER_TEMP/windows-e2e"
+      - name: Keep the run logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-containment-logs
+          path: ${{ runner.temp }}/windows-e2e/*.log
+          if-no-files-found: warn

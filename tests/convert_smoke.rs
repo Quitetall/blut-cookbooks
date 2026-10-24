@@ -16,6 +16,8 @@
 // std guard across an await is the deliberate serialization mechanism, not
 // a bug — there is no real async contention on this lock.
 #![allow(clippy::await_holding_lock)]
+// The stubs are shell scripts made executable with Unix permissions.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
