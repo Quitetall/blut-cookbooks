@@ -72,6 +72,20 @@ pub struct Args {
     /// rejected at deserialize time, not at the Python boundary.
     #[serde(default)]
     pub parallel_strategy: ParallelStrategy,
+    /// Mid-stage checkpoint cadence in steps. When the engine gives the stage
+    /// a checkpoint slot, the trainer saves every this many steps; unset, it
+    /// saves every `checkpoint_every_secs` seconds instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_every_steps: Option<u32>,
+    /// Mid-stage checkpoint cadence in seconds when `checkpoint_every_steps` is
+    /// unset. The trainer uses 600 when both are unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_every_secs: Option<u32>,
+    /// Print and emit the training loss every this many steps (`[trainer]
+    /// step N/T loss=…` and a `BLUT_METRIC` `step` line). Unset: epoch lines
+    /// only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_every_steps: Option<u32>,
 }
 
 /// Multi-GPU parallel strategy. `Ddp` (default) replicates the model per rank;
@@ -84,6 +98,12 @@ pub enum ParallelStrategy {
     #[default]
     Ddp,
     Fsdp,
+}
+
+/// Whether a training run with these arguments uses a checkpoint slot.
+fn wants_checkpoint_slot(args: &Args) -> bool {
+    let distributed = args.nproc_per_node.max(1) * args.nnodes.max(1) > 1;
+    !(distributed && args.parallel_strategy == ParallelStrategy::Fsdp)
 }
 
 impl ParallelStrategy {
@@ -130,6 +150,13 @@ impl Stage for TrainModel {
     /// DDP: hold N GPU permits when nproc_per_node > 1.
     fn gpu_permits(&self, args: &Args) -> u32 {
         args.nproc_per_node.max(1)
+    }
+
+    /// A mid-stage checkpoint slot, so an interrupted run resumes from its
+    /// last checkpoint. Not for distributed FSDP, whose sharded state the
+    /// trainer does not checkpoint mid-stage.
+    fn checkpoint_slot(&self, args: &Args) -> bool {
+        wants_checkpoint_slot(args)
     }
 
     /// DDP: scale memory reservation by nproc.
@@ -187,6 +214,9 @@ impl Stage for TrainModel {
             "parallel_strategy": args.parallel_strategy,
             "text_field": args.text_field,
             "max_seq_len": args.max_seq_len,
+            "checkpoint_every_steps": args.checkpoint_every_steps,
+            "checkpoint_every_secs": args.checkpoint_every_secs,
+            "log_every_steps": args.log_every_steps,
         });
         let config_path = ctx.stage_dir.join("train_config.json");
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).map_err(
@@ -196,41 +226,7 @@ impl Stage for TrainModel {
             },
         )?;
 
-        // Invoke the generic trainer where `--launcher` placed it: locally
-        // (via torchrun when distributed) or as a Slurm step.
-        let nproc = args.nproc_per_node.max(1);
-        let nnodes = args.nnodes.max(1);
-        let inner = [
-            "-m",
-            "blut_core.trainer",
-            "--config",
-            config_path.to_str().unwrap(),
-        ]
-        .map(String::from);
-        let (program, argv) = training_argv(
-            ctx.launch_target,
-            "python3",
-            nproc,
-            nnodes,
-            args.device != "cpu",
-            &inner,
-        )
-        .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-        let mut cmd = std::process::Command::new(program);
-        cmd.args(&argv);
-        cmd.current_dir(&ctx.stage_dir);
-
-        // Pin only when this node runs a single process. With several local
-        // ranks torchrun assigns devices through LOCAL_RANK and a pin would
-        // collapse every rank onto one card. One rank per node (the usual
-        // multi-node shape) still pins: LOCAL_RANK is 0 there, so device 0
-        // must be the card the scheduler actually granted.
-        // Under Slurm the allocation assigns devices, so only a local run pins.
-        if nproc <= 1 && ctx.launch_target == LaunchTarget::Local {
-            if let Some(dev) = ctx.device_index {
-                cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
-            }
-        }
+        let mut cmd = trainer_command(ctx, args, &config_path)?;
 
         let status = cmd.status().map_err(|e| {
             StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {e}"))
@@ -267,6 +263,56 @@ impl Stage for TrainModel {
     }
 }
 
+/// The trainer process for one attempt: where `--launcher` placed it, with
+/// the device pin and the checkpoint slot's environment.
+fn trainer_command(
+    ctx: &StageContext,
+    args: &Args,
+    config_path: &std::path::Path,
+) -> Result<std::process::Command, StageError> {
+    // Invoke the generic trainer where `--launcher` placed it: locally
+    // (via torchrun when distributed) or as a Slurm step.
+    let nproc = args.nproc_per_node.max(1);
+    let nnodes = args.nnodes.max(1);
+    let inner = [
+        "-m",
+        "blut_core.trainer",
+        "--config",
+        config_path.to_str().unwrap(),
+    ]
+    .map(String::from);
+    let (program, argv) = training_argv(
+        ctx.launch_target,
+        "python3",
+        nproc,
+        nnodes,
+        args.device != "cpu",
+        &inner,
+    )
+    .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&argv);
+    cmd.current_dir(&ctx.stage_dir);
+
+    // Pin only when this node runs a single process. With several local
+    // ranks torchrun assigns devices through LOCAL_RANK and a pin would
+    // collapse every rank onto one card. One rank per node (the usual
+    // multi-node shape) still pins: LOCAL_RANK is 0 there, so device 0
+    // must be the card the scheduler actually granted.
+    // Under Slurm the allocation assigns devices, so only a local run pins.
+    if nproc <= 1 && ctx.launch_target == LaunchTarget::Local {
+        if let Some(dev) = ctx.device_index {
+            cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
+        }
+    }
+    // The checkpoint slot (engine CONTRACT.md §8): where to checkpoint and
+    // whether to resume. `srun` and `torchrun` hand it to every rank.
+    if let Some(slot) = &ctx.checkpoint {
+        slot.apply_to(&mut cmd);
+    }
+    Ok(cmd)
+}
+
 /// `train_model` over the train half of a `DatasetSplit`.
 ///
 /// Exists so a recipe can fork a split into this training edge and a
@@ -288,6 +334,10 @@ impl Stage for TrainModelOnSplit {
 
     fn gpu_permits(&self, args: &Args) -> u32 {
         TrainModel.gpu_permits(args)
+    }
+
+    fn checkpoint_slot(&self, args: &Args) -> bool {
+        wants_checkpoint_slot(args)
     }
 
     fn memory_gib_for(&self, args: &Args) -> u32 {
@@ -342,6 +392,82 @@ mod tests {
         assert!(
             matches!(&r, Err(StageError::BadInput(m)) if m.contains("lora_adapter")),
             "got {r:?}"
+        );
+    }
+
+    fn minimal_args() -> Args {
+        serde_json::from_value(serde_json::json!({
+            "model": {"kind": "model", "name": "from_pretrained", "config": {}},
+            "optimizer": {"kind": "optimizer", "name": "adamw", "config": {}},
+            "scheduler": {"kind": "scheduler", "name": "constant", "config": {}},
+            "loss": {"kind": "loss", "name": "causal_lm", "config": {}},
+            "epochs": 1,
+        }))
+        .unwrap()
+    }
+
+    /// The cadence fields are new. Left unset they must not appear in the
+    /// serialized arguments, which are part of the stage's cache key: an
+    /// existing run keeps its identity.
+    #[test]
+    fn unset_checkpoint_fields_leave_the_arguments_unchanged() {
+        let v = serde_json::to_value(minimal_args()).unwrap();
+        for key in [
+            "checkpoint_every_steps",
+            "checkpoint_every_secs",
+            "log_every_steps",
+        ] {
+            assert!(v.get(key).is_none(), "{key} serialized while unset");
+        }
+    }
+
+    #[test]
+    fn training_opts_into_a_checkpoint_slot_except_distributed_fsdp() {
+        let mut a = minimal_args();
+        assert!(TrainModel.checkpoint_slot(&a));
+        assert!(TrainModelOnSplit.checkpoint_slot(&a));
+        a.nnodes = 2;
+        assert!(TrainModel.checkpoint_slot(&a), "multi-node DDP checkpoints");
+        a.parallel_strategy = ParallelStrategy::Fsdp;
+        assert!(!TrainModel.checkpoint_slot(&a));
+        assert!(!TrainModelOnSplit.checkpoint_slot(&a));
+    }
+
+    /// The slot reaches the trainer process as the contract's environment.
+    #[test]
+    fn the_slot_reaches_the_trainer_environment() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ctx = StageContext::for_test(td.path().to_path_buf(), td.path().join("stage"));
+        let mut args = minimal_args();
+        args.device = "cpu".into();
+        let config = td.path().join("train_config.json");
+        let env_of = |ctx: &StageContext| -> Vec<(String, String)> {
+            let cmd = trainer_command(ctx, &args, &config).unwrap();
+            let mut env: Vec<_> = cmd
+                .get_envs()
+                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+                .filter(|(k, _)| k.starts_with("BLUT_"))
+                .collect();
+            env.sort();
+            env
+        };
+        assert!(env_of(&ctx).is_empty(), "no slot, no contract variables");
+        let slot = td.path().join("slot");
+        ctx.checkpoint = Some(blut::framework::stage_checkpoint::CheckpointSlot::new(
+            slot.clone(),
+            true,
+            "job-1",
+            "job-1/inv/2",
+        ));
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            env_of(&ctx),
+            vec![
+                pair("BLUT_ATTEMPT_ID", "job-1/inv/2"),
+                pair("BLUT_CHECKPOINT_DIR", slot.to_str().unwrap()),
+                pair("BLUT_RESUME", "1"),
+                pair("BLUT_RUN_ID", "job-1"),
+            ]
         );
     }
 
