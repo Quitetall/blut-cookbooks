@@ -39,7 +39,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # The engine commit under test (Quitetall/blut, branch agent/windows-local).
-  BLUT_ENGINE_REV: ce98a580fa7081557bd678b128021e712cc6aef4
+  BLUT_ENGINE_REV: 0c869b9d9e89b0800eafd6a45d249cec053d2d31
   PYTHONUTF8: "1"
   HF_HUB_DISABLE_TELEMETRY: "1"
 jobs:
