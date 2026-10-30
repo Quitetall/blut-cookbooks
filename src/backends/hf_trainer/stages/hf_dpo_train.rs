@@ -136,6 +136,7 @@ impl Stage for HfDpoTrain {
             nproc_per_node: args.nproc_per_node,
             nnodes: args.nnodes,
             launch_target: ctx.launch_target,
+            slurm_job_name: Some(ctx.slurm_job_name()),
         };
 
         let status_tx = ctx.status_tx.clone();

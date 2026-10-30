@@ -173,6 +173,7 @@ impl Stage for HfSftTrain {
             nproc_per_node: args.nproc_per_node,
             nnodes: args.nnodes,
             launch_target: ctx.launch_target,
+            slurm_job_name: Some(ctx.slurm_job_name()),
         };
 
         // Fan tqdm-style step events into the executor's status

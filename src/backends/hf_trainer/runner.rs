@@ -81,6 +81,11 @@ pub struct HfTrainerJob {
     /// wrapper reads: it decides how the wrapper is started, not what it does.
     #[serde(skip)]
     pub launch_target: blut::config::launcher::LaunchTarget,
+    /// The Slurm job name under `--launcher slurm`
+    /// (`StageContext::slurm_job_name()`). `None` keeps the generic
+    /// `blut-train`, which `blut cancel` cannot find.
+    #[serde(skip)]
+    pub slurm_job_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -221,13 +226,14 @@ impl HfTrainerRunner {
             wrapper.display().to_string(),
             spec_path.display().to_string(),
         ];
-        let (program, argv) = crate::distributed::training_argv(
+        let (program, argv) = crate::distributed::training_argv_named(
             job.launch_target,
             &python.display().to_string(),
             job.nproc_per_node,
             job.nnodes,
             true,
             &inner,
+            job.slurm_job_name.as_deref().unwrap_or("blut-train"),
         )
         .map_err(RunError::Launch)?;
         let mut cmdline = vec![program];
@@ -446,6 +452,7 @@ mod tests {
             nproc_per_node: 1,
             nnodes: 1,
             launch_target: Default::default(),
+            slurm_job_name: None,
         };
         let s = serde_json::to_string(&job).unwrap();
         let back: HfTrainerJob = serde_json::from_str(&s).unwrap();
