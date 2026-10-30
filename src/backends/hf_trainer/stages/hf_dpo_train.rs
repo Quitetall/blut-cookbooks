@@ -4,14 +4,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::backends::HfTrainerBackend;
-use crate::backends::hf_trainer::{DpoConfig, HfTrainerJob, HfTrainerRunner, StatusLine};
+use crate::backends::hf_trainer::{DpoConfig, HfTrainerJob, HfTrainerRunner};
 use blut::artifacts::{HfCheckpoint, PreferenceJsonl};
 use blut::framework::artifact::ContentHash;
 use blut::framework::compat::Compatible;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
-use blut::framework::status::StageEvent;
 
 pub struct HfDpoTrain;
 impl Compatible<HfTrainerBackend> for HfDpoTrain {}
@@ -139,33 +138,8 @@ impl Stage for HfDpoTrain {
             slurm_job_name: Some(ctx.slurm_job_name()),
         };
 
-        let status_tx = ctx.status_tx.clone();
-        let node_idx = ctx.node_idx;
-        let cb = Box::new(move |s: StatusLine| match s {
-            StatusLine::Step {
-                step,
-                total,
-                loss,
-                lr,
-            } => {
-                let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx,
-                    stage_name: HfDpoTrain::NAME.to_string(),
-                    update: serde_json::json!({
-                        "kind": "hf_step", "step": step, "total": total,
-                        "loss": loss, "lr": lr,
-                    }),
-                });
-            }
-            StatusLine::Saved { path } => {
-                let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx,
-                    stage_name: HfDpoTrain::NAME.to_string(),
-                    update: serde_json::json!({"kind": "hf_saved", "path": path}),
-                });
-            }
-            _ => {}
-        }) as Box<dyn Fn(StatusLine) + Send + Sync>;
+        // The wrapper's progress, relayed in the engine's trainer format.
+        let cb = super::forward_status(ctx, HfDpoTrain::NAME);
 
         let mut runner = HfTrainerRunner::new();
         let result = runner

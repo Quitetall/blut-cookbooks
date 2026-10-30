@@ -12,7 +12,7 @@ The job JSON conforms to the `HfTrainerJob` struct in
 status event on stdout. Stderr is free-form.
 
 Wire schema (matches `runner::StatusLine`):
-  {"kind":"step","step":int,"total":int,"loss":float,"lr":float}
+  {"kind":"step","step":int,"total":int,"loss":float,"lr":float,"vram_mb":int}
   {"kind":"saved","path":str}
   {"kind":"done","checkpoint_dir":str,"final_loss":float}
   {"kind":"failed","error":str}
@@ -43,6 +43,19 @@ def _is_local_leader() -> bool:
     fail its stage.
     """
     return os.environ.get("LOCAL_RANK", "0") == "0"
+
+
+def _vram_mb() -> int:
+    """GPU memory this process holds, in MiB; 0 when it is not on a GPU.
+
+    The measure the lamu trainer reports (`torch.cuda.memory_allocated`). Reads
+    torch only if training already imported it, so loading this module never
+    pulls in the training stack.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_available():
+        return 0
+    return int(torch.cuda.memory_allocated() / (1024 * 1024))
 
 
 def emit(line: Dict[str, Any]) -> None:
@@ -215,6 +228,7 @@ def run_sft(spec: Dict[str, Any]) -> None:
                     "total": self.total,
                     "loss": self.last_loss,
                     "lr": float(logs.get("learning_rate", 0.0)) if "learning_rate" in logs else None,
+                    "vram_mb": _vram_mb(),
                 }
             )
 
@@ -312,6 +326,7 @@ def run_dpo(spec: Dict[str, Any]) -> None:
                     "lr": float(logs.get("learning_rate", 0.0))
                     if "learning_rate" in logs
                     else None,
+                    "vram_mb": _vram_mb(),
                 }
             )
 

@@ -61,3 +61,21 @@ def test_a_multi_node_job_saves_on_every_node(runner):
     assert runner._distributed_defaults({"nnodes": 2}) == {"save_on_each_node": True}
     assert runner._distributed_defaults({"nnodes": 1}) == {}
     assert runner._distributed_defaults({}) == {}
+
+
+def test_vram_is_zero_off_the_gpu_and_measured_on_it(runner, monkeypatch):
+    # The Rust side relays each step as the engine's trainer update, whose
+    # vram field `blut log` prints; it must be a measurement, never a guess.
+    import sys
+    import types
+
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    assert runner._vram_mb() == 0
+
+    cuda = types.SimpleNamespace(is_available=lambda: True,
+                                 memory_allocated=lambda: 3 * 1024 * 1024)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    assert runner._vram_mb() == 3
+
+    cuda.is_available = lambda: False
+    assert runner._vram_mb() == 0

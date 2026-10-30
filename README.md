@@ -111,6 +111,17 @@ training stages rather than run locally.
 (FSDP2: shard parameters, gradients, and optimizer state). The `hf_sft_train`
 and `hf_dpo_train` stages take the same `nproc_per_node` and `nnodes`.
 
+## Following a training stage
+
+`blut-core log <job>` prints a training stage's progress and `blut-core jobs`
+its latest step and loss, read from the updates the stage forwards in the
+engine's trainer format. `sft_train`, `hf_sft_train` and `hf_dpo_train` forward
+each step, save, and the final loss. `vram` is the GPU memory the trainer's
+process holds (0 off the GPU). An HF log with no loss or learning rate (an
+evaluation, the end-of-run summary) appears as `… step N/M` rather than with
+invented values, and a run that trained no step reports no final loss.
+`train_model` does not forward its progress this way yet.
+
 ## Resuming an interrupted training stage
 
 With BLUT 0.2.0-alpha.2 or later, `train_model` and `train_model_on_split`
