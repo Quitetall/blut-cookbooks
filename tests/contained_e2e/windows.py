@@ -18,7 +18,7 @@ what the Job Object containment does to real training processes:
 Every process the checks expect dead is first confirmed alive, so a probe
 that sees nothing cannot pass. Exits non-zero on the first failed check.
 
-Usage: python run.py --blut <path to blut-core.exe> --work <empty dir>
+Usage: python windows.py --blut <path to blut-core.exe> --work <empty dir>
 """
 from __future__ import annotations
 
@@ -83,20 +83,26 @@ def ingredients(model: dict) -> dict:
     }
 
 
+def unit_re(unit: str) -> str:
+    """The engine names a stage's unit `<unit>-<driver pid>-<sequence>`."""
+    return rf"{unit}-\d+-\d+"
+
+
 def check_stage(log: str, unit: str, min_peak: int) -> int:
     """The unit was placed, attached, and exited with a peak. Returns the peak."""
+    u = unit_re(unit)
     placed = re.findall(
-        rf"containment: {unit} placed by LocalSystemd under {BACKEND}, "
+        rf"containment: {u} placed by LocalSystemd under {BACKEND}, "
         r"memory cap (\d+) bytes", log)
     if len(placed) != 1:
         fail(f"{unit}: expected one placement line, found {len(placed)}")
     cap = int(placed[0])
     if cap != EXPECTED_CAP:
         fail(f"{unit}: memory cap {cap} bytes, expected {EXPECTED_CAP}")
-    if not re.search(rf"containment: {unit} attached to {BACKEND} \(pid \d+\)", log):
+    if not re.search(rf"containment: {u} attached to {BACKEND} \(pid \d+\)", log):
         fail(f"{unit}: placed but never reported attached to the Job Object")
     peaks = re.findall(
-        rf"containment: {unit} exited; peak memory (\d+) bytes \({BACKEND}\)", log)
+        rf"containment: {u} exited; peak memory (\d+) bytes \({BACKEND}\)", log)
     if len(peaks) != 1:
         fail(f"{unit}: expected one peak line, found {len(peaks)}")
     peak = int(peaks[0])
@@ -226,13 +232,13 @@ def run_timeout(blut: Path, work: Path, dataset: Path) -> None:
     if code == 0:
         fail("timeout: a timed-out plan exited 0")
     ok(f"timeout: the plan failed as it should (exit {code})")
-    if not re.search(rf"containment: blut-train_model cancelled; killing its process "
+    if not re.search(rf"{unit_re('blut-train_model')}: cancelled; stopping its process "
                      rf"tree \({BACKEND}\)", text):
         fail("timeout: no tree kill was logged for the timed-out stage")
     if "timed out" not in text:
         fail("timeout: the failure does not say the stage timed out")
     ok("timeout: the soft timeout cancelled the stage and killed its tree")
-    if not re.search(rf"containment: blut-train_model attached to {BACKEND}", text):
+    if not re.search(rf"containment: {unit_re('blut-train_model')} attached to {BACKEND}", text):
         fail("timeout: the trainer was never attached to its Job Object")
     check_no_unattached_job(text, "timeout")
     assert_tree_dead(tree, "timeout")
@@ -247,7 +253,7 @@ def run_driver_kill(blut: Path, work: Path, dataset: Path) -> None:
     log.close()
     text = read_log(log_path)
     print(text[-2000:])
-    if not re.search(rf"containment: blut-train_model attached to {BACKEND}", text):
+    if not re.search(rf"containment: {unit_re('blut-train_model')} attached to {BACKEND}", text):
         fail("driver-kill: the trainer was never attached to its Job Object")
     ok("driver-kill: the BLUT driver was killed outright")
     assert_tree_dead(tree, "driver-kill")

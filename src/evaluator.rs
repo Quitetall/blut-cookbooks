@@ -84,7 +84,7 @@ pub async fn run_evaluator(
         "--output".to_string(),
         output_path.display().to_string(),
     ];
-    // Contained on Windows (memory cap, peak, tree kill); see local_stage.
+    // Contained (memory cap, peak, tree kill on cancel or timeout); see local_stage.
     let status = crate::local_stage::run(
         ctx,
         LaunchTarget::Local,

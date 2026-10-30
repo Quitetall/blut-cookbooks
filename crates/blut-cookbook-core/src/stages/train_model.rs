@@ -228,7 +228,7 @@ impl Stage for TrainModel {
 
         let TrainerLaunch { cmdline, env } = trainer_command(ctx, args, &config_path)?;
 
-        // Contained on Windows (memory cap, peak, tree kill); see local_stage.
+        // Contained (memory cap, peak, tree kill on cancel or timeout); see local_stage.
         let status = blut_backends::local_stage::run(
             ctx,
             ctx.launch_target,

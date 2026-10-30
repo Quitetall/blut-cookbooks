@@ -238,9 +238,9 @@ impl HfTrainerRunner {
         .map_err(RunError::Launch)?;
         let mut cmdline = vec![program];
         cmdline.extend(argv);
-        // Contained on Windows for a local run (memory cap, peak, tree
-        // kill; the tree also dies if this future is dropped); see
-        // crate::local_stage.
+        // A local run is contained (memory cap, peak, tree kill; the tree
+        // also dies if this future is dropped), and on Unix the child leads
+        // its own process group (KILL-1); see crate::local_stage.
         let mut child = crate::local_stage::spawn(
             job.launch_target,
             "blut-hf_trainer",
@@ -252,16 +252,6 @@ impl HfTrainerRunner {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
-                // KILL-1: new session/process group — see python_kill::pre_exec_setsid.
-                #[cfg(unix)]
-                {
-                    // tokio's Command exposes `pre_exec` inherently.
-                    // SAFETY: setsid is async-signal-safe and allocates nothing.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        cmd.pre_exec(blut::python_kill::pre_exec_setsid);
-                    }
-                }
             },
         )
         .await
@@ -277,7 +267,6 @@ impl HfTrainerRunner {
 
         let started = Instant::now();
         let stdout = child.child_mut().stdout.take();
-        let stderr = child.child_mut().stderr.take();
         let on_status: Arc<dyn Fn(StatusLine) + Send + Sync> = Arc::from(on_status);
         let collected: Arc<Mutex<(Option<HfRunArtifact>, Option<String>)>> =
             Arc::new(Mutex::new((None, None)));
@@ -324,13 +313,9 @@ impl HfTrainerRunner {
             None
         };
 
-        let stderr_handle = stderr.map(|stderr| {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::warn!(target: "blut::hf_trainer_stderr", "{}", line);
-                }
-            })
+        // The pump also records the systemd backend's `Memory peak:` line.
+        child.pump_stderr(|line| {
+            tracing::warn!(target: "blut::hf_trainer_stderr", "{}", line);
         });
 
         let exit = child.wait().await.map_err(|e| RunError::Io {
@@ -341,11 +326,6 @@ impl HfTrainerRunner {
             && let Err(e) = h.await
         {
             tracing::error!(target: "blut::hf_trainer", "stdout reader join failed: {e}");
-        }
-        if let Some(h) = stderr_handle
-            && let Err(e) = h.await
-        {
-            tracing::error!(target: "blut::hf_trainer", "stderr reader join failed: {e}");
         }
         if let Some(pid) = self.child_pid.lock().take() {
             blut::python_kill::unregister_child(pid);

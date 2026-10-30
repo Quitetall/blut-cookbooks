@@ -137,9 +137,10 @@ impl TrainBackend for PythonTrainBackend {
         // For DDP: don't pin CUDA_VISIBLE_DEVICES — torchrun manages LOCAL_RANK
         env.extend(self.env.iter().cloned());
 
-        // Contained on Windows for a local run (memory cap, peak, tree kill;
-        // the tree also dies if this future is dropped); see
-        // crate::local_stage.
+        // A local run is contained (memory cap, peak, tree kill; the tree
+        // also dies if this future is dropped), and on Unix the child leads
+        // its own process group (KILL-1), so cancel reaches DataLoader workers
+        // and torchrun ranks; see crate::local_stage.
         let mut child = crate::local_stage::spawn(
             self.launch_target,
             "blut-lamu_trainer",
@@ -151,20 +152,6 @@ impl TrainBackend for PythonTrainBackend {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
-                // KILL-1: new session/process group so cancel can killpg the
-                // whole tree (DataLoader workers, torchrun ranks) — not just
-                // this direct child.
-                #[cfg(unix)]
-                {
-                    // tokio::process::Command exposes `pre_exec` inherently
-                    // (no std CommandExt import needed).
-                    // SAFETY: setsid is async-signal-safe; pre_exec_setsid
-                    // allocates nothing. Sound to run between fork and exec.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        cmd.pre_exec(blut::python_kill::pre_exec_setsid);
-                    }
-                }
             },
         )
         .await
@@ -187,10 +174,6 @@ impl TrainBackend for PythonTrainBackend {
         let stdout =
             child.child_mut().stdout.take().ok_or_else(|| {
                 TrainError::Trainer("trainer subprocess stdout pipe missing".into())
-            })?;
-        let stderr =
-            child.child_mut().stderr.take().ok_or_else(|| {
-                TrainError::Trainer("trainer subprocess stderr pipe missing".into())
             })?;
 
         let (artifact_tx, artifact_rx) = oneshot::channel();
@@ -253,25 +236,25 @@ impl TrainBackend for PythonTrainBackend {
         // Stderr drain. Forward to tracing so a buggy trainer's
         // python traceback doesn't disappear into a closed pipe. Stderr
         // chatter (e.g. tqdm) is also a liveness signal.
+        // The pump also records the systemd backend's `Memory peak:` line.
         let activity_stderr = Arc::clone(&last_activity);
-        let stderr_reader = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                *activity_stderr.lock() = Instant::now();
-                tracing::info!(target: "blut::trainer_stderr", "{}", line);
-            }
-        });
+        if !child.pump_stderr(move |line| {
+            *activity_stderr.lock() = Instant::now();
+            tracing::info!(target: "blut::trainer_stderr", "{}", line);
+        }) {
+            return Err(TrainError::Trainer(
+                "trainer subprocess stderr pipe missing".into(),
+            ));
+        }
 
         // D3 watchdog task (only when configured). Ticks at min(timeout/4,
-        // 30s); on idle > timeout it SIGTERMs the child group and records
-        // a reason. Aborted below once the child exits.
-        // Fired by the watchdog after its group kill: the contained wait
-        // below then kills the whole tree through the containment backend,
-        // which is the only tree kill on Windows (no process groups there).
+        // 30s); on idle > timeout it records a reason and fires
+        // `watchdog_kill`, and the wait below stops the whole tree
+        // (local_stage::stop_tree: the backend's teardown, or SIGTERM then
+        // SIGKILL to the process group). Aborted below once the child exits.
         let watchdog_kill = tokio_util::sync::CancellationToken::new();
         let watchdog = self.liveness_timeout.map(|timeout| {
             let activity = Arc::clone(&last_activity);
-            let pid_handle = Arc::clone(&self.child_pid);
             let reason = Arc::clone(&watchdog_reason);
             let kill = watchdog_kill.clone();
             tokio::spawn(async move {
@@ -283,25 +266,13 @@ impl TrainBackend for PythonTrainBackend {
                     if idle <= timeout {
                         continue;
                     }
-                    // Idle past the limit — record the reason (always) and
-                    // kill the child group if we have its pid, then stop.
                     *reason.lock() = Some(format!(
                         "liveness watchdog: no output for {idle:?} (limit {timeout:?})"
                     ));
-                    // Bind the Copy pid (drop the guard) before the await.
-                    let pid = *pid_handle.lock();
-                    match pid {
-                        Some(pid) => {
-                            tracing::warn!(
-                                "liveness watchdog: no trainer output for {idle:?} (> {timeout:?}); \
-                                 killing pid {pid}"
-                            );
-                            blut::python_kill::graceful_kill_pid(pid, Duration::from_secs(10)).await;
-                        }
-                        None => tracing::warn!(
-                            "liveness watchdog: idle {idle:?} but no child pid to kill"
-                        ),
-                    }
+                    tracing::warn!(
+                        "liveness watchdog: no trainer output for {idle:?} (> {timeout:?}); \
+                         stopping it"
+                    );
                     kill.cancel();
                     return;
                 }
@@ -309,8 +280,7 @@ impl TrainBackend for PythonTrainBackend {
         });
 
         // `None`: the watchdog fired and the tree was killed.
-        let exit_status = child
-            .wait_or_cancel(&watchdog_kill)
+        let exit_status = crate::local_stage::wait_or_cancel(&mut child, &watchdog_kill)
             .await
             .map_err(|e| TrainError::Trainer(format!("wait for trainer.py: {e}")))?;
 
@@ -323,7 +293,6 @@ impl TrainBackend for PythonTrainBackend {
         // do once the child exits). Awaiting here serializes the
         // final on_status callback before we return.
         let _ = stdout_reader.await;
-        let _ = stderr_reader.await;
 
         if let Some(pid) = self.child_pid.lock().take() {
             blut::python_kill::unregister_child(pid);
