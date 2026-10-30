@@ -14,7 +14,8 @@
 //!
 //!   - `stages::*` — concrete generic-LLM ingredient impls (materialize,
 //!     filter, split, sft/dpo/distill train, merge_lora, convert_gguf,
-//!     register_model, eval_*).
+//!     register_model, eval_*, and `to_checks_jsonl` / `from_checks_jsonl`,
+//!     which put a dataset behind the engine's `check_jsonl` / `assert`).
 //!   - `backends::*` — the concrete training-backend identities
 //!     (`HfTrainerBackend`, `LamuTrainerBackend`) + their subprocess
 //!     runners / venv management / backend-specific ingredients. Re-exports
@@ -114,6 +115,13 @@ static STANDARD_STAGES_ERASED: &[(&str, blut::framework::stage::ErasedStageCtor)
     ("eval_judge", || std::sync::Arc::new(stages::EvalJudge)),
     ("merge_reports", || {
         std::sync::Arc::new(stages::MergeReports)
+    }),
+    // Carry a dataset across the engine's `check_jsonl` / `assert` guards.
+    ("to_checks_jsonl", || {
+        std::sync::Arc::new(stages::ToChecksJsonl)
+    }),
+    ("from_checks_jsonl", || {
+        std::sync::Arc::new(stages::FromChecksJsonl)
     }),
     // HF-backend-specific ingredients
     ("hf_sft_train", || {

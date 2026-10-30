@@ -10,6 +10,7 @@
 //! register_model. eval_* and the parallel-executor branch stages
 //! ship in later commits.
 
+pub mod checks_jsonl;
 pub mod convert_gguf;
 pub mod distill_train;
 pub mod dpo_train;
@@ -33,6 +34,7 @@ pub(crate) mod util;
 pub mod catalog;
 mod compat_impls;
 
+pub use checks_jsonl::{FromChecksJsonl, ToChecksJsonl};
 pub use convert_gguf::ConvertGguf;
 pub use distill_train::DistillTrain;
 pub use dpo_train::DpoTrain;

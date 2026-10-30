@@ -6,7 +6,7 @@ runtime they launch.
 
 | Crate | Binary | What it holds |
 |---|---|---|
-| `blut-cookbook-standard` | `blut-standard` | Generic-LLM stages (materialize, filter, split, SFT/DPO training, LoRA merge, GGUF conversion, evaluation) and the `hf_trainer` and `lamu` training backends |
+| `blut-cookbook-standard` | `blut-standard` | Generic-LLM stages (materialize, filter, split, SFT/DPO training, LoRA merge, GGUF conversion, evaluation, the adapters that put a dataset behind the engine's checks) and the `hf_trainer` and `lamu` training backends |
 | `blut-cookbook-core` | `blut-core` | Generic ML recipes — `train_from_dataset`, `finetune_pretrained`, `eval_only` — built from swappable Python ingredients |
 
 `python/blut_core` is the Python runtime both crates launch: the ingredient
@@ -49,6 +49,38 @@ blut-core recipe run train_from_dataset --args '{
 ```
 
 `blut-core recipe show train_from_dataset` prints the full argument schema.
+
+## Guarding a dataset
+
+The engine's `check_jsonl` (row-count bounds) and `assert` (a scalar
+predicate) stages stop a plan before bad data reaches training. They take the
+engine's `checks.jsonl` artifact, and the data stages here emit
+`dataset.jsonl`, so a guard sits between `to_checks_jsonl` and
+`from_checks_jsonl`:
+
+```text
+load_dataset → to_checks_jsonl → check_jsonl → from_checks_jsonl → split_train_eval
+```
+
+Neither adapter copies the file. `from_checks_jsonl` hands on the row count the
+guard enforced (non-blank lines, as `load_dataset` counts them), so the
+consumer gets the dataset it would have had without the guard. Put the guard
+on the path to the consumer, as here: a guard on a side branch does not stop
+the consumer.
+
+`crates/blut-cookbook-core/examples/guarded_dataset.json` is this plan as a
+declared recipe. Set its dataset path and row bounds, then:
+
+```sh
+blut-core recipe declare crates/blut-cookbook-core/examples/guarded_dataset.json --run
+blut-core checks report <job>
+```
+
+With `on_breach: "block"` (the default) a breach fails the guard and nothing
+after it runs; `"warn"` records the breach and continues. `check_jsonl` checks
+only the row count, so a malformed row that keeps the count in bounds passes.
+`assert` compares the `actual` value written in its arguments; nothing feeds
+it a measured one. Compiled recipes of either backend can use the same stages.
 
 ## Distributed training
 
