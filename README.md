@@ -101,11 +101,15 @@ With `--launcher slurm`, run the recipe once, from a host that can submit jobs.
 Each training stage becomes one `srun` step with `--nodes=<nnodes>`, one task per
 node, and `--gpus-per-node=<nproc_per_node>` unless `device` is `cpu`. Every
 node takes its rank from `SLURM_NODEID` and the coordinator from the first host
-in the allocation (or `MASTER_ADDR`, if set). `BLUT_SLURM_PARTITION`, `_MEM`,
+in the allocation (or `MASTER_ADDR`, if set). The step is named
+`blut-<job>-<node>`, the name the engine records with the BLUT job, so
+`blut-core cancel` can stop it and `plan resume` can see it after the process
+that submitted it is gone. `BLUT_SLURM_PARTITION`, `_MEM`,
 `_CPUS`, `_TIME` and `_GPUS` pass through. A `BLUT_SLURM_NODES` or
 `_NTASKS_PER_NODE` that contradicts the stage is an error. The job directory
-must be on a filesystem every node can read. Other launchers are refused by the
-training stages rather than run locally.
+must be on a filesystem every node can read. This holds for `train_model`,
+`hf_sft_train`, `hf_dpo_train`, and the lamu backend's `sft_train`. Other
+launchers are refused by the training stages rather than run locally.
 
 `parallel_strategy` selects `ddp` (replicate the model, the default) or `fsdp`
 (FSDP2: shard parameters, gradients, and optimizer state). The `hf_sft_train`
