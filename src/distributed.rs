@@ -155,6 +155,22 @@ pub fn training_argv(
     gpus: bool,
     inner: &[String],
 ) -> Result<(String, Vec<String>), String> {
+    training_argv_named(target, python, nproc, nnodes, gpus, inner, "blut-train")
+}
+
+/// [`training_argv`] with the Slurm job name to use. Stages pass
+/// `StageContext::slurm_job_name()`: the engine records that name with the
+/// BLUT job, so `blut cancel` stops, and `plan resume` sees, a Slurm job left
+/// running by a BLUT process that was killed.
+pub fn training_argv_named(
+    target: LaunchTarget,
+    python: &str,
+    nproc: u32,
+    nnodes: u32,
+    gpus: bool,
+    inner: &[String],
+    job_name: &str,
+) -> Result<(String, Vec<String>), String> {
     let (nproc, nnodes) = (nproc.max(1), nnodes.max(1));
     match target {
         LaunchTarget::Local => {
@@ -171,7 +187,7 @@ pub fn training_argv(
             task.push(python.to_string());
             task.extend(inner.iter().cloned());
             let w = slurm_launcher(nproc, nnodes, gpus)?
-                .wrap("blut-train", &task)
+                .wrap(job_name, &task)
                 .map_err(|e| format!("slurm launcher: {e}"))?;
             Ok((w.program, w.args))
         }

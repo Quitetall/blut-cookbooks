@@ -18,7 +18,7 @@ use blut::framework::stage::{Stage, StageContext};
 
 use super::shared::IngredientCfg;
 use blut::config::launcher::LaunchTarget;
-use blut_backends::distributed::training_argv;
+use blut_backends::distributed::training_argv_named;
 
 pub struct TrainModel;
 
@@ -302,13 +302,14 @@ fn trainer_command(
     ]
     .map(String::from);
     let python = blut_backends::local_stage::python();
-    let (program, argv) = training_argv(
+    let (program, argv) = training_argv_named(
         ctx.launch_target,
         &python,
         nproc,
         nnodes,
         args.device != "cpu",
         &inner,
+        &ctx.slurm_job_name(),
     )
     .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
     let mut cmdline = vec![program];
@@ -489,6 +490,29 @@ mod tests {
                 pair("BLUT_RESUME", "1"),
                 pair("BLUT_RUN_ID", "job-1"),
             ]
+        );
+    }
+
+    /// Under `--launcher slurm` the step carries the name the engine records
+    /// with the BLUT job, so `blut cancel` can stop a Slurm job that outlived
+    /// the process that started it.
+    #[test]
+    fn a_slurm_step_is_named_after_the_job_and_node() {
+        let td = tempfile::tempdir().unwrap();
+        let job_dir = td.path().join("20261029-120000-1");
+        let mut ctx = StageContext::for_test(job_dir.clone(), job_dir.join("stage"));
+        ctx.launch_target = LaunchTarget::Slurm;
+        ctx.node_idx = 2;
+        let mut args = minimal_args();
+        args.device = "cpu".into();
+        let launch = trainer_command(&ctx, &args, &td.path().join("c.json")).unwrap();
+        assert_eq!(launch.cmdline[0], "srun");
+        assert!(
+            launch
+                .cmdline
+                .contains(&"--job-name=blut-20261029-120000-1-2".to_string()),
+            "{:?}",
+            launch.cmdline
         );
     }
 

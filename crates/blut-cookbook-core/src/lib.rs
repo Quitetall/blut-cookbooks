@@ -48,6 +48,11 @@ static CORE_STAGES_ERASED: &[(&str, ErasedStageCtor)] = &[
 pub struct CoreCookbook;
 
 impl Cookbook for CoreCookbook {
+    /// This build, folded into every stage cache key: crate name, version,
+    /// and the git commit and uncommitted changes `build.rs` stamps.
+    fn identity(&self) -> Option<blut::framework::code_identity::BuildIdentity> {
+        Some(blut::cookbook_identity!())
+    }
     fn name(&self) -> &'static str {
         "core"
     }
