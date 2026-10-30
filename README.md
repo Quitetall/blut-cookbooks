@@ -79,6 +79,30 @@ training stages rather than run locally.
 (FSDP2: shard parameters, gradients, and optimizer state). The `hf_sft_train`
 and `hf_dpo_train` stages take the same `nproc_per_node` and `nnodes`.
 
+## Resuming an interrupted training stage
+
+With BLUT 0.2.0-alpha.2 or later, `train_model` and `train_model_on_split`
+checkpoint during training and resume from the newest checkpoint when the stage
+runs again: after a retry, after `blut-core plan resume <job>`, or when a Slurm
+batch job that ran the recipe is requeued and runs it again. The engine keys the
+checkpoint directory by the stage's arguments and inputs, so a changed config or
+dataset starts from step 0. See the engine's `CONTRACT.md` §8.
+
+| Argument | Meaning |
+|---|---|
+| `checkpoint_every_steps` | Checkpoint every N steps |
+| `checkpoint_every_secs` | Otherwise every N seconds (default 600) |
+| `log_every_steps` | Print the loss every N steps |
+| `train_attempts` | Attempts for the training stage, the first included (default 1) |
+
+A resumed run continues the step count, the data order, the optimizer and RNG
+state, and the loss, so it ends with the weights an uninterrupted run would
+have. The trainer keeps the two newest checkpoints and skips one that is
+partial, corrupt, or written for another config or world size. Under DDP only
+rank 0 reads and writes checkpoints; the directory (`$BLUT_CHECKPOINTS_DIR`,
+default beside the jobs directory) must be on rank 0's node. FSDP runs do not
+checkpoint mid-stage and restart from step 0.
+
 ## License
 
 Apache-2.0. See `LICENSE` and `NOTICE`.
