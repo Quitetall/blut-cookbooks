@@ -6,7 +6,7 @@ runtime they launch.
 
 | Crate | Binary | What it holds |
 |---|---|---|
-| `blut-cookbook-standard` | `blut-standard` | Generic-LLM stages (materialize, filter, split, SFT/DPO training, LoRA merge, GGUF conversion, evaluation) and the `hf_trainer` and `lamu` training backends |
+| `blut-cookbook-standard` | `blut-standard` | Generic-LLM stages (materialize, filter, split, SFT/DPO training, LoRA merge, GGUF conversion, evaluation, the adapters that put a dataset behind the engine's checks) and the `hf_trainer` and `lamu` training backends |
 | `blut-cookbook-core` | `blut-core` | Generic ML recipes — `train_from_dataset`, `finetune_pretrained`, `eval_only` — built from swappable Python ingredients |
 
 `python/blut_core` is the Python runtime both crates launch: the ingredient
@@ -50,6 +50,38 @@ blut-core recipe run train_from_dataset --args '{
 
 `blut-core recipe show train_from_dataset` prints the full argument schema.
 
+## Guarding a dataset
+
+The engine's `check_jsonl` (row-count bounds) and `assert` (a scalar
+predicate) stages stop a plan before bad data reaches training. They take the
+engine's `checks.jsonl` artifact, and the data stages here emit
+`dataset.jsonl`, so a guard sits between `to_checks_jsonl` and
+`from_checks_jsonl`:
+
+```text
+load_dataset → to_checks_jsonl → check_jsonl → from_checks_jsonl → split_train_eval
+```
+
+Neither adapter copies the file. `from_checks_jsonl` hands on the row count the
+guard enforced (non-blank lines, as `load_dataset` counts them), so the
+consumer gets the dataset it would have had without the guard. Put the guard
+on the path to the consumer, as here: a guard on a side branch does not stop
+the consumer.
+
+`crates/blut-cookbook-core/examples/guarded_dataset.json` is this plan as a
+declared recipe. Set its dataset path and row bounds, then:
+
+```sh
+blut-core recipe declare crates/blut-cookbook-core/examples/guarded_dataset.json --run
+blut-core checks report <job>
+```
+
+With `on_breach: "block"` (the default) a breach fails the guard and nothing
+after it runs; `"warn"` records the breach and continues. `check_jsonl` checks
+only the row count, so a malformed row that keeps the count in bounds passes.
+`assert` compares the `actual` value written in its arguments; nothing feeds
+it a measured one. Compiled recipes of either backend can use the same stages.
+
 ## Distributed training
 
 Set `nproc_per_node` for several GPUs on one machine. Set `nnodes` as well to
@@ -69,15 +101,30 @@ With `--launcher slurm`, run the recipe once, from a host that can submit jobs.
 Each training stage becomes one `srun` step with `--nodes=<nnodes>`, one task per
 node, and `--gpus-per-node=<nproc_per_node>` unless `device` is `cpu`. Every
 node takes its rank from `SLURM_NODEID` and the coordinator from the first host
-in the allocation (or `MASTER_ADDR`, if set). `BLUT_SLURM_PARTITION`, `_MEM`,
+in the allocation (or `MASTER_ADDR`, if set). The step is named
+`blut-<job>-<node>`, the name the engine records with the BLUT job, so
+`blut-core cancel` can stop it and `plan resume` can see it after the process
+that submitted it is gone. `BLUT_SLURM_PARTITION`, `_MEM`,
 `_CPUS`, `_TIME` and `_GPUS` pass through. A `BLUT_SLURM_NODES` or
 `_NTASKS_PER_NODE` that contradicts the stage is an error. The job directory
-must be on a filesystem every node can read. Other launchers are refused by the
-training stages rather than run locally.
+must be on a filesystem every node can read. This holds for `train_model`,
+`hf_sft_train`, `hf_dpo_train`, and the lamu backend's `sft_train`. Other
+launchers are refused by the training stages rather than run locally.
 
 `parallel_strategy` selects `ddp` (replicate the model, the default) or `fsdp`
 (FSDP2: shard parameters, gradients, and optimizer state). The `hf_sft_train`
 and `hf_dpo_train` stages take the same `nproc_per_node` and `nnodes`.
+
+## Following a training stage
+
+`blut-core log <job>` prints a training stage's progress and `blut-core jobs`
+its latest step and loss, read from the updates the stage forwards in the
+engine's trainer format. `sft_train`, `hf_sft_train` and `hf_dpo_train` forward
+each step, save, and the final loss. `vram` is the GPU memory the trainer's
+process holds (0 off the GPU). An HF log with no loss or learning rate (an
+evaluation, the end-of-run summary) appears as `… step N/M` rather than with
+invented values, and a run that trained no step reports no final loss.
+`train_model` does not forward its progress this way yet.
 
 ## Resuming an interrupted training stage
 

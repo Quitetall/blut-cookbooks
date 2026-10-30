@@ -130,7 +130,7 @@ impl Stage for SftTrain {
             paths::resolve_python().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
         let trainer_script =
             paths::resolve_trainer_script().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
-        let mut backend = PythonTrainBackend::new(python, trainer_script);
+        let mut backend = trainer_backend(ctx, python, trainer_script);
 
         // Forward StageStep events from trainer.py's per-step
         // status updates so the unified status.jsonl carries them.
@@ -168,5 +168,65 @@ impl Stage for SftTrain {
             content_hash: hash,
             final_loss: artifact.final_loss,
         })
+    }
+}
+
+/// The trainer for this stage, placed where `--launcher` says. Under Slurm its
+/// job carries `ctx.slurm_job_name()`, the name the engine records with the
+/// BLUT job, so `blut cancel` can stop, and `plan resume` can see, a trainer
+/// left running by a BLUT process that was killed.
+fn trainer_backend(
+    ctx: &StageContext,
+    python: std::path::PathBuf,
+    trainer_script: std::path::PathBuf,
+) -> PythonTrainBackend {
+    PythonTrainBackend::new(python, trainer_script)
+        .with_launch_target(ctx.launch_target)
+        .with_job_name(ctx.slurm_job_name())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blut::config::launcher::LaunchTarget;
+
+    /// Under `--launcher slurm` the trainer's step is named after the job and
+    /// node, as `train_model`'s and the HF stages' are.
+    #[test]
+    fn a_slurm_step_is_named_after_the_job_and_node() {
+        let td = tempfile::tempdir().unwrap();
+        let job_dir = td.path().join("20261030-120000-1");
+        let mut ctx = StageContext::for_test(job_dir.clone(), job_dir.join("stage"));
+        ctx.launch_target = LaunchTarget::Slurm;
+        ctx.node_idx = 2;
+        let spec = TrainSpec {
+            base_model: "org/m".into(),
+            output_name: "named".into(),
+            output_dir: td.path().join("out"),
+            method: Method::Full,
+            dataset: DatasetSource::JsonlPath {
+                path: td.path().join("x.jsonl"),
+            },
+            optimizer: Optim::AdamW,
+            lr: 2e-4,
+            epochs: 1,
+            batch_size: 1,
+            grad_accum: 1,
+            seq_len: 512,
+            seed: 42,
+            quant: "Q4_K_M".into(),
+            skip_convert: true,
+            nproc_per_node: 1,
+            nnodes: 1,
+            dpo_beta: None,
+        };
+        let cmd = trainer_backend(&ctx, "py".into(), "trainer.py".into())
+            .command(&spec, "{}")
+            .unwrap();
+        assert_eq!(cmd[0], "srun");
+        assert!(
+            cmd.contains(&"--job-name=blut-20261030-120000-1-2".to_string()),
+            "{cmd:?}"
+        );
     }
 }

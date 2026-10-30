@@ -46,10 +46,14 @@ pub struct PythonTrainBackend {
     /// old trainers (no heartbeats) are unaffected.
     pub liveness_timeout: Option<Duration>,
     /// Where to place the trainer (#3). `Local` (default) spawns it directly
-    /// here (byte-identical to the original behavior); `Slurm`/`Ray` wrap the
-    /// `python script spec` invocation via the matching launcher so the SAME
-    /// streaming/cancel path runs against a cluster-placed job.
+    /// here; `Slurm` runs it as one `srun` step, placed by
+    /// `distributed::training_argv_named` like every other training process,
+    /// with the SAME streaming/cancel path. Any other target is refused.
     launch_target: blut::config::launcher::LaunchTarget,
+    /// The Slurm job name: the stage's `StageContext::slurm_job_name()`, which
+    /// the engine records with the BLUT job. `None` keeps the generic
+    /// `blut-train`, which `blut cancel` and `plan resume` cannot find.
+    job_name: Option<String>,
     child_pid: Arc<Mutex<Option<u32>>>,
 }
 
@@ -61,6 +65,7 @@ impl PythonTrainBackend {
             env: Vec::new(),
             liveness_timeout: None,
             launch_target: blut::config::launcher::LaunchTarget::Local,
+            job_name: None,
             child_pid: Arc::new(Mutex::new(None)),
         }
     }
@@ -81,6 +86,40 @@ impl PythonTrainBackend {
         self.launch_target = target;
         self
     }
+
+    /// Name the Slurm job. A stage passes `ctx.slurm_job_name()`, so
+    /// `blut cancel` can stop, and `plan resume` can see, a trainer the BLUT
+    /// process that started it left running.
+    pub fn with_job_name(mut self, name: impl Into<String>) -> Self {
+        self.job_name = Some(name.into());
+        self
+    }
+
+    /// The trainer's command line for `spec_json`:
+    /// `python [torchrun prefix] trainer.py <spec>`, placed where
+    /// `launch_target` says (`srun --job-name=<job_name> …` under Slurm).
+    pub(crate) fn command(&self, spec: &TrainSpec, spec_json: &str) -> Result<Vec<String>> {
+        let inner = [
+            self.trainer_script.display().to_string(),
+            spec_json.to_string(),
+        ];
+        // DDP: when nproc_per_node > 1 the trainer runs under torchrun, which
+        // initializes the process group; under Slurm each node resolves its
+        // own rank from the allocation.
+        let (program, argv) = crate::distributed::training_argv_named(
+            self.launch_target,
+            &self.python.display().to_string(),
+            spec.nproc_per_node,
+            spec.nnodes,
+            true,
+            &inner,
+            self.job_name.as_deref().unwrap_or("blut-train"),
+        )
+        .map_err(TrainError::other)?;
+        let mut cmdline = vec![program];
+        cmdline.extend(argv);
+        Ok(cmdline)
+    }
 }
 
 #[async_trait]
@@ -90,52 +129,9 @@ impl TrainBackend for PythonTrainBackend {
         let spec_json = serde_json::to_string(&spec)
             .map_err(|e| TrainError::other(format!("serialize TrainSpec for trainer.py: {e}")))?;
 
-        // Local spawns the trainer directly (byte-identical to the original);
-        // Slurm/Ray wrap `python script spec` via the launcher (program/argv/env
-        // are launcher data) but keep the SAME streaming + cancel path below.
-        //
-        // DDP: when nproc_per_node > 1, launch via `torchrun --nproc_per_node=N`
-        // instead of bare python, so the trainer auto-initializes DDP.
-        use crate::distributed::launch_prefix;
-        use blut::config::launcher::{LaunchTarget, launcher_for};
-        let nproc = spec.nproc_per_node.max(1);
-        let nnodes = spec.nnodes.max(1);
-        let (cmdline, mut env) = match self.launch_target {
-            LaunchTarget::Local => {
-                let mut c = vec![self.python.display().to_string()];
-                c.extend(launch_prefix(nproc, nnodes).map_err(TrainError::other)?);
-                c.push(self.trainer_script.display().to_string());
-                c.push(spec_json.clone());
-                (c, Vec::new())
-            }
-            target => {
-                let mut inner_args =
-                    vec![self.trainer_script.display().to_string(), spec_json.clone()];
-                // Slurm/Ray: the same torchrun prefix the Local arm builds.
-                // It used to be assembled separately here, and got it wrong:
-                // `--standalone` went in unconditionally and `--nnodes N` was
-                // appended after it. `--standalone` *is* a single-node
-                // rendezvous and overrides `--nnodes`, so a multi-node job
-                // wrapped by a launcher silently ran as N disconnected
-                // single-node jobs — and no `--node_rank` or `--rdzv_endpoint`
-                // was ever passed for the nodes to find each other with.
-                let prefix = launch_prefix(nproc, nnodes).map_err(TrainError::other)?;
-                for (i, arg) in prefix.into_iter().enumerate() {
-                    inner_args.insert(i, arg);
-                }
-                let inner_prog = self.python.display().to_string();
-                let mut full_inner = vec![inner_prog];
-                full_inner.extend(inner_args);
-                let w = launcher_for(target)
-                    .wrap("blut-train", &full_inner)
-                    .map_err(|e| TrainError::other(format!("launcher wrap: {e}")))?;
-                let mut c = vec![w.program];
-                c.extend(w.args);
-                (c, w.env)
-            }
-        };
+        let cmdline = self.command(&spec, &spec_json)?;
         // For DDP: don't pin CUDA_VISIBLE_DEVICES — torchrun manages LOCAL_RANK
-        env.extend(self.env.iter().cloned());
+        let env = self.env.clone();
 
         // A local run is contained (memory cap, peak, tree kill; the tree
         // also dies if this future is dropped), and on Unix the child leads
@@ -346,6 +342,83 @@ impl TrainBackend for PythonTrainBackend {
 
 async fn graceful_kill(pid: u32) {
     blut::python_kill::graceful_kill_pid(pid, Duration::from_secs(10)).await
+}
+
+/// Where the trainer runs, and what its Slurm job is called.
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use blut::config::launcher::LaunchTarget;
+    use blut::spec::{DatasetSource, Method, Optim, TrainSpec};
+
+    fn spec() -> TrainSpec {
+        TrainSpec {
+            base_model: "org/m".into(),
+            output_name: "placement".into(),
+            output_dir: PathBuf::from("out"),
+            method: Method::Full,
+            dataset: DatasetSource::JsonlPath {
+                path: PathBuf::from("x.jsonl"),
+            },
+            optimizer: Optim::AdamW,
+            lr: 2e-4,
+            epochs: 1,
+            batch_size: 1,
+            grad_accum: 1,
+            seq_len: 512,
+            seed: 42,
+            quant: "Q4_K_M".into(),
+            skip_convert: true,
+            dpo_beta: None,
+            nproc_per_node: 1,
+            nnodes: 1,
+        }
+    }
+
+    fn backend() -> PythonTrainBackend {
+        PythonTrainBackend::new("py".into(), "trainer.py".into())
+    }
+
+    #[test]
+    fn a_local_run_is_the_bare_trainer() {
+        assert_eq!(
+            backend().command(&spec(), "{}").unwrap(),
+            ["py", "trainer.py", "{}"]
+        );
+    }
+
+    /// The name the stage hands over is the Slurm job's name, which the
+    /// engine records with the BLUT job: `blut cancel` and `plan resume` find
+    /// the job by it. The generic `blut-train` they cannot.
+    #[test]
+    fn a_slurm_step_carries_the_name_it_was_given() {
+        let cmd = backend()
+            .with_launch_target(LaunchTarget::Slurm)
+            .with_job_name("blut-20261030-120000-1-2")
+            .command(&spec(), "{}")
+            .unwrap();
+        assert_eq!(cmd[0], "srun");
+        assert!(
+            cmd.contains(&"--job-name=blut-20261030-120000-1-2".to_string()),
+            "{cmd:?}"
+        );
+        assert!(!cmd.iter().any(|a| a == "--job-name=blut-train"), "{cmd:?}");
+        assert_eq!(cmd[cmd.len() - 3..], ["py", "trainer.py", "{}"]);
+    }
+
+    /// A placement this backend cannot honor is an error, never a local run.
+    #[test]
+    fn another_launcher_is_refused() {
+        let err = backend()
+            .with_launch_target(LaunchTarget::Ray)
+            .command(&spec(), "{}")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("training cannot run under --launcher"),
+            "{err}"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
