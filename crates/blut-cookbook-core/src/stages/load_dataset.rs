@@ -106,7 +106,7 @@ impl Stage for LoadDataset {
                     cmdline.extend(["--max-samples".to_string(), max.to_string()]);
                 }
                 // A local helper process wherever the recipe trains, so
-                // contained as a local one (on Windows); see local_stage.
+                // contained as a local one; see local_stage.
                 let status = blut_backends::local_stage::run(
                     ctx,
                     LaunchTarget::Local,

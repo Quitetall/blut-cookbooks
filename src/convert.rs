@@ -20,13 +20,18 @@ use std::path::{Path, PathBuf};
 use blut::config::launcher::LaunchTarget;
 use blut::error::{Result, TrainError};
 
-/// Run one conversion tool to completion with inherited stdio, contained on
-/// Windows (see [`crate::local_stage`]). The child dies with this future.
+/// Run one conversion tool to completion, contained (see
+/// [`crate::local_stage`]). Stdout is inherited; stderr is relayed line by
+/// line, which carries the systemd backend's peak to the engine. The tree
+/// dies with this future.
 async fn run_tool(unit: &str, cmdline: &[String]) -> Result<std::process::ExitStatus> {
     let mut child = crate::local_stage::spawn(LaunchTarget::Local, unit, cmdline, None, &[], |c| {
-        c.kill_on_drop(true);
+        c.stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
     })
     .await?;
+    child.pump_stderr(|line| eprintln!("{line}"));
     child.wait().await
 }
 
