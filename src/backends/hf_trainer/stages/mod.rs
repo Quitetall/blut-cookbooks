@@ -14,37 +14,24 @@ pub use hf_dpo_train::HfDpoTrain;
 pub use hf_sft_train::HfSftTrain;
 
 use blut::framework::stage::StageContext;
-use blut::framework::status::StageEvent;
 
 use super::StatusLine;
 
 /// The status callback an HF stage hands its runner: each wrapper line goes to
-/// the executor as a `StageStep` whose `update` is the engine's trainer update
-/// ([`StatusLine::status_update`]). That is the format `blut log` and
-/// `blut jobs` read from a stage's forwarded progress; the `hf_step` and
-/// `hf_saved` payloads these stages used to send were in no format they
-/// parse, so an HF stage's progress never reached either.
+/// the executor as the engine's trainer update
+/// ([`StatusLine::status_update`]), through [`crate::progress::Forwarder`].
+/// That is the format `blut log` and `blut jobs` read from a stage's forwarded
+/// progress; the `hf_step` and `hf_saved` payloads these stages used to send
+/// were in no format they parse, so an HF stage's progress never reached
+/// either.
 pub(crate) fn forward_status(
     ctx: &StageContext,
     stage_name: &'static str,
 ) -> Box<dyn Fn(StatusLine) + Send + Sync> {
-    let status_tx = ctx.status_tx.clone();
-    // This stage's topo position, so a consumer (`blut log`, the HPO
-    // scheduler) attributes each update to the right node.
-    let node_idx = ctx.node_idx;
+    let forwarder = crate::progress::Forwarder::new(ctx, stage_name);
     Box::new(move |line: StatusLine| {
-        let Some(update) = line.status_update() else {
-            return;
-        };
-        match serde_json::to_value(&update) {
-            Ok(update) => {
-                let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx,
-                    stage_name: stage_name.to_string(),
-                    update,
-                });
-            }
-            Err(e) => tracing::warn!("{stage_name}: cannot serialize a trainer update: {e}"),
+        if let Some(update) = line.status_update() {
+            forwarder.send(&update);
         }
     })
 }

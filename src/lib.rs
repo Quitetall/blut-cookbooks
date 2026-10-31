@@ -24,6 +24,8 @@
 //!     `StatusFn` (the runtime contract a concrete trainer implements).
 //!   - `convert` — HF checkpoint → GGUF conversion (llama.cpp tools).
 //!   - `conversations` — lamu conversation-DB → JSONL dump.
+//!   - `progress` — forwards a trainer's updates as its stage's progress,
+//!     the format `blut log` and `blut jobs` read.
 //!   - `StandardCookbook` — the `Cookbook` impl + `registry()` entry point.
 //!
 //! The engine primitives the ingredients wire (framework, artifacts, config,
@@ -43,6 +45,7 @@ pub mod convert;
 pub mod distributed;
 pub mod evaluator;
 pub mod local_stage;
+pub mod progress;
 pub mod stages;
 
 /// Process-wide lock for tests that mutate environment variables.

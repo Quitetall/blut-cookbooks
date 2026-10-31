@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -26,7 +27,7 @@ from pathlib import Path
 # Ensure blut_core is importable
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from blut_core import build_ingredient, list_ingredients
+from blut_core import build_ingredient, list_ingredients, status
 from blut_core.lm_data import is_causal_lm, pack_token_blocks, texts_from_rows
 from blut_core.spec import KINDS
 
@@ -54,6 +55,42 @@ def _ddp_world_size() -> int:
 
 def _is_rank0() -> bool:
     return _ddp_rank() == 0
+
+
+# ---------------------------------------------------------------------------
+# Progress for the launching stage
+# ---------------------------------------------------------------------------
+#
+# `train_model` reads this process's stdout and forwards `BLUT_STATUS` lines
+# (``status.relay``) to the engine as the stage's progress, which is what
+# `blut log` and `blut jobs` show; the `[trainer]` lines stay the terminal's.
+# Rank 0 reports progress; a failure is reported by the rank that hit it.
+
+def _current_lr(optimizer) -> "float | None":
+    """The learning rate the first parameter group steps with now, or None
+    when the optimizer has none to read."""
+    try:
+        return float(optimizer.param_groups[0]["lr"])
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _vram_mb(device) -> int:
+    """GPU memory this process holds on ``device``, in MiB; 0 off the GPU."""
+    import torch
+    if not str(device).startswith("cuda") or not torch.cuda.is_available():
+        return 0
+    return int(torch.cuda.memory_allocated(device) / (1024 * 1024))
+
+
+def _report_step(step: int, total: int, loss: float, lr, vram_mb: int) -> None:
+    """One logged step. The engine's step update needs a finite loss and a
+    learning rate; a step without them is reported as a heartbeat that names
+    it, never with a value filled in."""
+    if lr is not None and math.isfinite(loss) and math.isfinite(lr):
+        status.relay("step", step=step, total=total, loss=loss, lr=lr, vram_mb=vram_mb)
+    else:
+        status.relay("heartbeat", phase=f"step {step}/{total} loss={loss}", vram_mb=vram_mb)
 
 
 def _ddp_device(device: str) -> str:
@@ -848,6 +885,9 @@ def train_loop(config: dict, ingredients: dict, dataset):
             print(f"[trainer] checkpoints {cadence} in {slot.dir}")
     last_saved_step = global_step
     last_save_time = time.monotonic()
+    # The last epoch's mean training loss: what `done` reports. None until an
+    # epoch completes in this attempt.
+    final_loss = None
 
     def _checkpoint_due() -> bool:
         if every_steps > 0:
@@ -889,6 +929,7 @@ def train_loop(config: dict, ingredients: dict, dataset):
             }
             path = slot.save(payload, step=global_step, epoch=epoch_no)
             print(f"[trainer] checkpoint step {global_step}/{total_steps} -> {path.name}")
+            status.relay("saved", path=str(path))
         last_saved_step = global_step
         last_save_time = time.monotonic()
 
@@ -952,6 +993,8 @@ def train_loop(config: dict, ingredients: dict, dataset):
                     if _is_rank0():
                         emit({"step": global_step, "loss": value, "epoch": epoch}, kind="step")
                         print(f"[trainer] step {global_step}/{total_steps} loss={value:.4f}")
+                        _report_step(global_step, total_steps, value,
+                                     _current_lr(optimizer), _vram_mb(rank_dev))
                 if slot is not None and _checkpoint_due():
                     partial = (epoch_loss, device_loss_sum.detach().to("cpu").clone()
                                if device_loss_sum is not None else None)
@@ -990,6 +1033,8 @@ def train_loop(config: dict, ingredients: dict, dataset):
                     metrics["lr"] = scheduler.get_last_lr()[0]
                 emit(metrics, kind="epoch")
                 print(f"[trainer] epoch {epoch}/{epochs}: loss={avg_loss:.4f}")
+                status.relay("heartbeat", phase=f"epoch {epoch}/{epochs} loss={avg_loss:.4f}")
+                final_loss = avg_loss
     finally:
         # Stop the heartbeat however the loop ends. After a failure the marker
         # keeps the last durable step, so the next attempt can resume from it.
@@ -1034,6 +1079,7 @@ def train_loop(config: dict, ingredients: dict, dataset):
         else:
             save_fn({"model": model_state}, str(ckpt_path))
         print(f"[trainer] checkpoint saved to {ckpt_path}")
+        status.relay("saved", path=str(ckpt_path))
 
         # Also save in HuggingFace format if possible. FSDP's sharded module
         # can't `save_pretrained` directly (params are DTensors); skip it —
@@ -1056,6 +1102,10 @@ def train_loop(config: dict, ingredients: dict, dataset):
 
     if _is_rank0():
         print("[trainer] training complete")
+        # An attempt that resumed past its last epoch trained none here and
+        # has no loss of its own to report, so it sends no `done`.
+        if final_loss is not None:
+            status.relay("done", final_loss=final_loss, checkpoint_dir=str(output_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -1067,10 +1117,14 @@ def main():
     parser.add_argument("--config", required=True, help="Path to ingredient config JSON")
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    ingredients = build_all_ingredients(config)
-    dataset = load_dataset(config)
-    train_loop(config, ingredients, dataset)
+    try:
+        config = load_config(args.config)
+        ingredients = build_all_ingredients(config)
+        dataset = load_dataset(config)
+        train_loop(config, ingredients, dataset)
+    except Exception as e:
+        status.relay("failed", error=f"{type(e).__name__}: {e}")
+        raise
 
 
 if __name__ == "__main__":

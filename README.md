@@ -119,12 +119,23 @@ and `hf_dpo_train` stages take the same `nproc_per_node` and `nnodes`.
 
 `blut-core log <job>` prints a training stage's progress and `blut-core jobs`
 its latest step and loss, read from the updates the stage forwards in the
-engine's trainer format. `sft_train`, `hf_sft_train` and `hf_dpo_train` forward
-each step, save, and the final loss. `vram` is the GPU memory the trainer's
-process holds (0 off the GPU). An HF log with no loss or learning rate (an
-evaluation, the end-of-run summary) appears as `… step N/M` rather than with
-invented values, and a run that trained no step reports no final loss.
-`train_model` does not forward its progress this way yet.
+engine's trainer format. `vram` is the GPU memory the trainer's process holds
+(0 off the GPU). No value a trainer did not measure is filled in.
+
+- `train_model` and `train_model_on_split` forward each step logged by
+  `log_every_steps` (its loss, the optimizer's learning rate), each checkpoint
+  save, every epoch as `… epoch E/N loss=<mean>`, and, as the final loss, the
+  last epoch's mean loss. Without `log_every_steps` there are no step lines.
+  The trainer writes these to stdout as `BLUT_STATUS <json>` lines, which the
+  stage forwards and keeps off the terminal; the `[trainer]` lines are
+  unchanged.
+- `sft_train`, `hf_sft_train` and `hf_dpo_train` forward each step, save, and
+  the final loss. An HF log with no loss or learning rate (an evaluation, the
+  end-of-run summary) appears as `… step N/M`, and a run that trained no step
+  reports no final loss.
+
+A step whose loss is not a finite number, or whose learning rate cannot be
+read, appears as `… step N/M` as well.
 
 ## Resuming an interrupted training stage
 
@@ -139,7 +150,7 @@ dataset starts from step 0. See the engine's `CONTRACT.md` §8.
 |---|---|
 | `checkpoint_every_steps` | Checkpoint every N steps |
 | `checkpoint_every_secs` | Otherwise every N seconds (default 600) |
-| `log_every_steps` | Print the loss every N steps |
+| `log_every_steps` | Print and report the loss every N steps |
 | `train_attempts` | Attempts for the training stage, the first included (default 1) |
 
 A resumed run continues the step count, the data order, the optimizer and RNG

@@ -215,9 +215,102 @@ pub async fn run(
     }
 }
 
+/// How long, after the stage process exits, its stdout may stay open (held by
+/// a straggling grandchild) before [`run_reading_stdout`] stops reading.
+const STDOUT_DRAIN: Duration = Duration::from_secs(10);
+
+/// [`run`], with the process's stdout read line by line and handed to
+/// `on_line` instead of inherited: how a stage relays a trainer's progress
+/// (see `crate::progress`). `on_line` decides what reaches the terminal. A
+/// line that is not UTF-8 is passed on lossily rather than ending the read,
+/// which would leave the process blocked on a full pipe.
+pub async fn run_reading_stdout(
+    ctx: &StageContext,
+    target: LaunchTarget,
+    unit: &str,
+    inner: &[String],
+    cwd: Option<&Path>,
+    env: &[(String, String)],
+    mut on_line: impl FnMut(&str) + Send + 'static,
+) -> Result<ExitStatus, StageError> {
+    use tokio::io::AsyncBufReadExt;
+    let mut child = spawn(target, unit, inner, cwd, env, |c| {
+        c.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+    })
+    .await
+    .map_err(|e| StageError::Backend(anyhow::anyhow!("{unit}: {e}")))?;
+    let stdout = child
+        .child_mut()
+        .stdout
+        .take()
+        .ok_or_else(|| StageError::Backend(anyhow::anyhow!("{unit}: stdout pipe missing")))?;
+    let mut reader = tokio::spawn(async move {
+        let mut stdout = tokio::io::BufReader::new(stdout);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match stdout.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    on_line(line.trim_end_matches(['\n', '\r']));
+                }
+            }
+        }
+    });
+    child.pump_stderr(|line| eprintln!("{line}"));
+    let outcome = wait_or_cancel(&mut child, &ctx.cancel)
+        .await
+        .map_err(|e| StageError::Backend(anyhow::anyhow!("{unit}: {e}")));
+    // Every line the process wrote is handled before the stage returns.
+    if tokio::time::timeout(STDOUT_DRAIN, &mut reader)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "{unit}: stdout still open {STDOUT_DRAIN:?} after the process exited; \
+             no longer reading it"
+        );
+        reader.abort();
+    }
+    match outcome? {
+        Some(status) => Ok(status),
+        None => Err(StageError::Cancelled),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every stdout line reaches the handler, in order, the last one without
+    /// a newline included, and a non-UTF-8 line does not end the read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_lines_reach_the_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = StageContext::for_test(tmp.path().to_path_buf(), tmp.path().join("s"));
+        let script = r"printf 'one\n\377bad\nthree'; exit 4";
+        let inner = ["sh", "-c", script].map(String::from);
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = lines.clone();
+        let status = run_reading_stdout(
+            &ctx,
+            LaunchTarget::Local,
+            "stdout-relay-test",
+            &inner,
+            Some(tmp.path()),
+            &[],
+            move |l| seen.lock().unwrap().push(l.to_string()),
+        )
+        .await
+        .expect("run");
+        assert_eq!(status.code(), Some(4));
+        assert_eq!(*lines.lock().unwrap(), ["one", "\u{fffd}bad", "three"]);
+    }
 
     #[test]
     fn python_defaults_per_platform() {
