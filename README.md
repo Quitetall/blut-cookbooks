@@ -130,9 +130,10 @@ engine's trainer format. `vram` is the GPU memory the trainer's process holds
   stage forwards and keeps off the terminal; the `[trainer]` lines are
   unchanged.
 - `sft_train`, `hf_sft_train` and `hf_dpo_train` forward each step, save, and
-  the final loss. An HF log with no loss or learning rate (an evaluation, the
-  end-of-run summary) appears as `… step N/M`, and a run that trained no step
-  reports no final loss.
+  the final loss. The HF stages also forward each evaluation HF logs, as
+  `eval @<step>  loss=<eval_loss>`. An HF log with no loss or learning rate
+  (the end-of-run summary) appears as `… step N/M`, and a run that trained no
+  step reports no final loss.
 
 A step whose loss is not a finite number, or whose learning rate cannot be
 read, appears as `… step N/M` as well.

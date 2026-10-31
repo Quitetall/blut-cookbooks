@@ -129,8 +129,8 @@ mod tests {
         )
         .unwrap();
 
-        // The wrapper's stdout for a short run: an evaluation-style log with
-        // no learning rate, two measured steps, a save, and the end.
+        // The wrapper's stdout for a short run: a log with no loss or learning
+        // rate yet, two measured steps, an evaluation, a save, and the end.
         let ckpt = root.join("ckpt");
         std::fs::create_dir_all(&ckpt).unwrap();
         std::fs::write(ckpt.join("adapter_model.safetensors"), b"weights").unwrap();
@@ -142,6 +142,7 @@ mod tests {
                 "echo '{{\"kind\":\"step\",\"step\":1,\"total\":4,\"loss\":null,\"lr\":null,\"vram_mb\":0}}'\n\
                  echo '{{\"kind\":\"step\",\"step\":2,\"total\":4,\"loss\":2.5,\"lr\":0.0002,\"vram_mb\":812}}'\n\
                  echo '{{\"kind\":\"step\",\"step\":4,\"total\":4,\"loss\":1.5,\"lr\":0.0001,\"vram_mb\":812}}'\n\
+                 echo '{{\"kind\":\"eval\",\"step\":4,\"eval_loss\":1.9}}'\n\
                  echo '{{\"kind\":\"saved\",\"path\":\"{c}/checkpoint-4\"}}'\n\
                  echo '{{\"kind\":\"done\",\"checkpoint_dir\":\"{c}\",\"final_loss\":1.75}}'\n"
             ),
@@ -204,6 +205,10 @@ mod tests {
                     lr: 0.0001,
                     vram_mb: 812,
                 },
+                StatusUpdate::Eval {
+                    step: 4,
+                    eval_loss: 1.9,
+                },
                 StatusUpdate::Saved {
                     path: run.ckpt.join("checkpoint-4"),
                 },
@@ -221,6 +226,7 @@ mod tests {
         let log = &run.log;
         assert!(log.contains("… step 1/4"), "{log}");
         assert!(log.contains("step 4/4  loss=1.5000"), "{log}");
+        assert!(log.contains("eval @4  loss=1.9000"), "{log}");
         assert!(log.contains("done  final_loss=1.7500"), "{log}");
     }
 

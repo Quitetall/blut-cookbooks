@@ -79,3 +79,21 @@ def test_vram_is_zero_off_the_gpu_and_measured_on_it(runner, monkeypatch):
 
     cuda.is_available = lambda: False
     assert runner._vram_mb() == 0
+
+
+def test_a_log_event_becomes_its_status_lines(runner, monkeypatch):
+    # HF logs training, evaluation and the end-of-run summary through one
+    # callback. An evaluation is the engine's `eval` update; the others are
+    # steps, with the latest training loss and, from a training log, the
+    # learning rate. Nothing HF did not log is filled in.
+    monkeypatch.setattr(runner, "_vram_mb", lambda: 7)
+    lines = runner._LogLines()
+    lines.total = 10
+    assert lines.lines({"eval_loss": 1.5, "eval_runtime": 0.2}, 0) == [
+        {"kind": "eval", "step": 0, "eval_loss": 1.5}]
+    assert lines.lines({"loss": 2.0, "learning_rate": 1e-4, "epoch": 0.5}, 5) == [
+        {"kind": "step", "step": 5, "total": 10, "loss": 2.0, "lr": 1e-4, "vram_mb": 7}]
+    assert lines.lines({"eval_loss": 1.25}, 5) == [
+        {"kind": "eval", "step": 5, "eval_loss": 1.25}]
+    assert lines.lines({"train_runtime": 3.0, "train_loss": 1.9}, 10) == [
+        {"kind": "step", "step": 10, "total": 10, "loss": 2.0, "lr": None, "vram_mb": 7}]
