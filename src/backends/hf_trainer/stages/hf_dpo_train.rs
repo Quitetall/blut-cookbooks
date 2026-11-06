@@ -158,7 +158,7 @@ impl Stage for HfDpoTrain {
             base_model: args.base_model.clone(),
             method_tag: "dpo".into(),
             content_hash,
-            final_loss: crate::progress::checkpoint_loss(HfDpoTrain::NAME, result.final_loss),
+            final_loss: result.final_loss,
         })
     }
 }

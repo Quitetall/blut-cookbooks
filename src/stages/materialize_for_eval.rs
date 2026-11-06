@@ -92,7 +92,7 @@ impl Stage for MaterializeForEval {
             base_model: args.base_model.clone(),
             method_tag: "loaded".into(),
             content_hash: ckpt_hash,
-            final_loss: 0.0,
+            final_loss: None,
         };
 
         let ds_hash =

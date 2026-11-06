@@ -166,7 +166,7 @@ impl Stage for SftTrain {
             base_model: args.base_model.clone(),
             method_tag: args.method.clone(),
             content_hash: hash,
-            final_loss: artifact.final_loss,
+            final_loss: Some(artifact.final_loss),
         })
     }
 }

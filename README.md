@@ -139,9 +139,7 @@ A step whose loss is not a finite number, or whose learning rate cannot be
 read, appears as `… step N/M` as well.
 
 The checkpoint these stages produce records the final loss the trainer
-reported. When it reported none (a run that trained no step), the checkpoint
-still records 0.0, with a warning in the log: the engine's `HfCheckpoint`
-requires a number there.
+reported, or none when it reported none (a run that trained no step).
 
 ## Resuming an interrupted training stage
 

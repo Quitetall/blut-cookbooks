@@ -104,11 +104,14 @@ mod tests {
         log: String,
         /// The checkpoint directory the stub reported.
         ckpt: PathBuf,
+        /// The final loss the stage's checkpoint records.
+        final_loss: Option<f32>,
     }
 
-    /// Run one stage against the stub and return what the engine reads back.
+    /// Run one stage against the stub, whose `done` line reports `final_loss`
+    /// (JSON), and return what the engine reads back.
     #[allow(clippy::await_holding_lock)]
-    async fn relayed<F, Fut>(run: F) -> Relayed
+    async fn relayed<F, Fut>(final_loss: &str, run: F) -> Relayed
     where
         F: FnOnce(StageContext, &Path) -> Fut,
         Fut: Future<Output = Result<HfCheckpoint, StageError>>,
@@ -144,7 +147,7 @@ mod tests {
                  echo '{{\"kind\":\"step\",\"step\":4,\"total\":4,\"loss\":1.5,\"lr\":0.0001,\"vram_mb\":812}}'\n\
                  echo '{{\"kind\":\"eval\",\"step\":4,\"eval_loss\":1.9}}'\n\
                  echo '{{\"kind\":\"saved\",\"path\":\"{c}/checkpoint-4\"}}'\n\
-                 echo '{{\"kind\":\"done\",\"checkpoint_dir\":\"{c}\",\"final_loss\":1.75}}'\n"
+                 echo '{{\"kind\":\"done\",\"checkpoint_dir\":\"{c}\",\"final_loss\":{final_loss}}}'\n"
             ),
         );
 
@@ -165,8 +168,6 @@ mod tests {
         std::fs::create_dir_all(&ctx.stage_dir).unwrap();
         let out = run(ctx, root).await.expect("the stage completes");
         assert_eq!(out.path, ckpt);
-        // The checkpoint records the final loss the trainer reported.
-        assert_eq!(out.final_loss, 1.75);
         drop(hub);
         writer.await.unwrap().expect("status.jsonl written");
 
@@ -182,6 +183,7 @@ mod tests {
             summary,
             log,
             ckpt,
+            final_loss: out.final_loss,
         }
     }
 
@@ -220,6 +222,8 @@ mod tests {
                 },
             ]
         );
+        // The checkpoint records the final loss the trainer reported.
+        assert_eq!(run.final_loss, Some(1.75));
         // `blut jobs`
         assert_eq!(run.summary.last_step, Some(4));
         assert_eq!(run.summary.last_loss, Some(1.5));
@@ -234,27 +238,47 @@ mod tests {
 
     #[tokio::test]
     async fn hf_sft_progress_reaches_blut_log_and_blut_jobs() {
-        let run = relayed(|ctx, root| {
-            let data = root.join("train.jsonl");
-            std::fs::write(&data, "{\"text\":\"hello\"}\n").unwrap();
-            let input = DatasetJsonl {
-                content_hash: ContentHash::hash_file(&data).unwrap(),
-                path: data,
-                n_examples: 1,
-            };
-            let args = serde_json::from_value(
-                serde_json::json!({"base_model": "org/model", "lr": 1e-4, "epochs": 1}),
-            )
-            .unwrap();
-            async move { HfSftTrain.run(&ctx, input, &args).await }
-        })
-        .await;
+        let run = relayed("1.75", sft_stage).await;
         assert_progress_is_visible(&run);
+    }
+
+    /// A run that trained no step has no final loss: the checkpoint records
+    /// none, and no `done` reaches `blut jobs`.
+    #[tokio::test]
+    async fn a_run_with_no_training_loss_records_none() {
+        let run = relayed("null", sft_stage).await;
+        assert_eq!(run.final_loss, None);
+        assert_eq!(run.summary.final_loss, None);
+        assert!(
+            !run.updates
+                .iter()
+                .any(|u| matches!(u, StatusUpdate::Done { .. })),
+            "{:?}",
+            run.updates
+        );
+    }
+
+    fn sft_stage(
+        ctx: StageContext,
+        root: &Path,
+    ) -> impl Future<Output = Result<HfCheckpoint, StageError>> + use<> {
+        let data = root.join("train.jsonl");
+        std::fs::write(&data, "{\"text\":\"hello\"}\n").unwrap();
+        let input = DatasetJsonl {
+            content_hash: ContentHash::hash_file(&data).unwrap(),
+            path: data,
+            n_examples: 1,
+        };
+        let args = serde_json::from_value(
+            serde_json::json!({"base_model": "org/model", "lr": 1e-4, "epochs": 1}),
+        )
+        .unwrap();
+        async move { HfSftTrain.run(&ctx, input, &args).await }
     }
 
     #[tokio::test]
     async fn hf_dpo_progress_reaches_blut_log_and_blut_jobs() {
-        let run = relayed(|ctx, root| {
+        let run = relayed("1.75", |ctx, root| {
             let data = root.join("prefs.jsonl");
             std::fs::write(&data, "{\"prompt\":\"p\",\"chosen\":\"c\",\"rejected\":\"r\"}\n")
                 .unwrap();

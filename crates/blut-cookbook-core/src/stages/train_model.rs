@@ -295,13 +295,12 @@ async fn train(
     let content_hash = ContentHash::hash_dir(&output_dir)
         .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {e}")))?;
 
-    let reported_loss = *reported_loss.lock().unwrap_or_else(|p| p.into_inner());
     Ok(HfCheckpoint {
         path: output_dir,
         base_model: args.model.name.clone(),
         method_tag: "full".into(),
         content_hash,
-        final_loss: blut_backends::progress::checkpoint_loss(stage_name, reported_loss),
+        final_loss: *reported_loss.lock().unwrap_or_else(|p| p.into_inner()),
     })
 }
 
