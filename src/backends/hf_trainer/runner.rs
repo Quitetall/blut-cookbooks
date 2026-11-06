@@ -9,6 +9,7 @@
 //!     paths, hyperparams) without bumping ARG_MAX.
 //!   - Stdout: one JSON line per status event. Schema:
 //!     `{"kind": "step", "step": int, "total": int, "loss": f, "lr": f, "vram_mb": int}`
+//!     `{"kind": "eval", "step": int, "eval_loss": f}`
 //!     `{"kind": "saved", "path": str}`
 //!     `{"kind": "done", "checkpoint_dir": str, "final_loss": f}`
 //!     `{"kind": "failed", "error": str}`
@@ -124,13 +125,18 @@ pub enum StatusLine {
         /// The latest logged training loss; `None` until HF has logged one.
         #[serde(default)]
         loss: Option<f32>,
-        /// `None` on a log that is not a training log (an evaluation, the
-        /// end-of-run summary).
+        /// `None` on a log that is not a training log (the end-of-run
+        /// summary; an evaluation is an `eval` line).
         #[serde(default)]
         lr: Option<f32>,
         /// GPU memory the reporting process holds, in MiB (0 off the GPU).
         #[serde(default)]
         vram_mb: Option<u32>,
+    },
+    /// An evaluation pass HF logged, with its loss.
+    Eval {
+        step: u64,
+        eval_loss: f32,
     },
     Saved {
         path: PathBuf,
@@ -181,6 +187,10 @@ impl StatusLine {
             } => StatusUpdate::Heartbeat {
                 phase: Some(format!("step {step}/{total}")),
                 vram_mb: *vram_mb,
+            },
+            StatusLine::Eval { step, eval_loss } => StatusUpdate::Eval {
+                step: count(*step),
+                eval_loss: *eval_loss,
             },
             StatusLine::Saved { path } => StatusUpdate::Saved { path: path.clone() },
             StatusLine::Done {
@@ -544,6 +554,13 @@ mod tests {
             })
         );
         assert_eq!(
+            update(r#"{"kind":"eval","step":4,"eval_loss":1.25}"#),
+            Some(StatusUpdate::Eval {
+                step: 4,
+                eval_loss: 1.25
+            })
+        );
+        assert_eq!(
             update(r#"{"kind":"saved","path":"/c/checkpoint-4"}"#),
             Some(StatusUpdate::Saved {
                 path: "/c/checkpoint-4".into()
@@ -565,7 +582,7 @@ mod tests {
     }
 
     /// What HF did not measure is not invented: a step without a logged loss
-    /// or learning rate (an evaluation log, the end-of-run summary) still
+    /// or learning rate (the end-of-run summary) still
     /// shows progress, as a heartbeat, and a run with no training loss has no
     /// `done` update rather than a zero one.
     #[test]

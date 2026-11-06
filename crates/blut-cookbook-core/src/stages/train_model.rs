@@ -3,7 +3,8 @@
 //! Generic training stage that invokes the ingredient-based trainer
 //! (`blut_core.trainer`). Takes a `DatasetJsonl` input, writes an
 //! ingredient config JSON, shells out to the Python trainer, and
-//! returns an `HfCheckpoint`.
+//! returns an `HfCheckpoint`. The trainer's `BLUT_STATUS` stdout lines are
+//! forwarded to the engine as the stage's progress (`blut_backends::progress`).
 //!
 //! Nondeterministic (training is stochastic).
 
@@ -15,6 +16,7 @@ use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
+use blut::protocol::StatusUpdate;
 
 use super::shared::IngredientCfg;
 use blut::config::launcher::LaunchTarget;
@@ -82,7 +84,8 @@ pub struct Args {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_every_secs: Option<u32>,
     /// Print and emit the training loss every this many steps (`[trainer]
-    /// step N/T loss=…` and a `BLUT_METRIC` `step` line). Unset: epoch lines
+    /// step N/T loss=…`, a `BLUT_METRIC` `step` line, and a step update the
+    /// stage forwards to `blut log` and `blut jobs`). Unset: epoch lines
     /// only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_every_steps: Option<u32>,
@@ -170,110 +173,136 @@ impl Stage for TrainModel {
         input: DatasetJsonl,
         args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
-        // Validate inputs
-        if args.epochs == 0 {
-            return Err(StageError::BadInput("epochs must be > 0".into()));
-        }
-        if args.batch_size == 0 {
-            return Err(StageError::BadInput("batch_size must be > 0".into()));
-        }
-        if args.lora_rank.is_some() {
-            return Err(StageError::BadInput(
-                "lora_rank is not read by the trainer; set the rank in the \
-                 lora_adapter model ingredient's config instead"
-                    .into(),
-            ));
-        }
-        if !input.path.exists() {
-            return Err(StageError::BadInput(format!(
-                "dataset not found: {}",
-                input.path.display()
-            )));
-        }
-
-        let output_dir = ctx.stage_dir.join("checkpoint");
-        std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {
-            path: output_dir.clone(),
-            source,
-        })?;
-
-        // Write ingredient config JSON
-        let config = serde_json::json!({
-            "dataset_path": input.path,
-            "output_dir": output_dir,
-            "model": args.model,
-            "optimizer": args.optimizer,
-            "scheduler": args.scheduler,
-            "loss": args.loss,
-            "step": args.step,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "seed": args.seed,
-            "device": args.device,
-            "lora_rank": args.lora_rank,
-            "parallel_strategy": args.parallel_strategy,
-            "text_field": args.text_field,
-            "max_seq_len": args.max_seq_len,
-            "checkpoint_every_steps": args.checkpoint_every_steps,
-            "checkpoint_every_secs": args.checkpoint_every_secs,
-            "log_every_steps": args.log_every_steps,
-        });
-        let config_path = ctx.stage_dir.join("train_config.json");
-        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).map_err(
-            |source| StageError::Io {
-                path: config_path.clone(),
-                source,
-            },
-        )?;
-
-        let TrainerLaunch { cmdline, env } = trainer_command(ctx, args, &config_path)?;
-
-        // Contained (memory cap, peak, tree kill on cancel or timeout); see local_stage.
-        let status = blut_backends::local_stage::run(
-            ctx,
-            ctx.launch_target,
-            "blut-train_model",
-            &cmdline,
-            Some(&ctx.stage_dir),
-            &env,
-        )
-        .await
-        .map_err(|e| match e {
-            StageError::Backend(e) => {
-                StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {e}"))
-            }
-            other => other,
-        })?;
-
-        if !status.success() {
-            return Err(StageError::Backend(anyhow::anyhow!(
-                "blut_core.trainer exited with {status}"
-            )));
-        }
-
-        // Verify output exists
-        if !output_dir.exists()
-            || output_dir
-                .read_dir()
-                .map_or(true, |mut d| d.next().is_none())
-        {
-            return Err(StageError::Backend(anyhow::anyhow!(
-                "trainer did not produce checkpoint in {}",
-                output_dir.display()
-            )));
-        }
-
-        let content_hash = ContentHash::hash_dir(&output_dir)
-            .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {e}")))?;
-
-        Ok(HfCheckpoint {
-            path: output_dir,
-            base_model: args.model.name.clone(),
-            method_tag: "full".into(),
-            content_hash,
-            final_loss: 0.0, // filled by trainer
-        })
+        train(ctx, input, args, Self::NAME).await
     }
+}
+
+/// One training stage's run, its progress attributed to `stage_name`.
+async fn train(
+    ctx: &StageContext,
+    input: DatasetJsonl,
+    args: &Args,
+    stage_name: &'static str,
+) -> Result<HfCheckpoint, StageError> {
+    // Validate inputs
+    if args.epochs == 0 {
+        return Err(StageError::BadInput("epochs must be > 0".into()));
+    }
+    if args.batch_size == 0 {
+        return Err(StageError::BadInput("batch_size must be > 0".into()));
+    }
+    if args.lora_rank.is_some() {
+        return Err(StageError::BadInput(
+            "lora_rank is not read by the trainer; set the rank in the \
+             lora_adapter model ingredient's config instead"
+                .into(),
+        ));
+    }
+    if !input.path.exists() {
+        return Err(StageError::BadInput(format!(
+            "dataset not found: {}",
+            input.path.display()
+        )));
+    }
+
+    let output_dir = ctx.stage_dir.join("checkpoint");
+    std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {
+        path: output_dir.clone(),
+        source,
+    })?;
+
+    // Write ingredient config JSON
+    let config = serde_json::json!({
+        "dataset_path": input.path,
+        "output_dir": output_dir,
+        "model": args.model,
+        "optimizer": args.optimizer,
+        "scheduler": args.scheduler,
+        "loss": args.loss,
+        "step": args.step,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "device": args.device,
+        "lora_rank": args.lora_rank,
+        "parallel_strategy": args.parallel_strategy,
+        "text_field": args.text_field,
+        "max_seq_len": args.max_seq_len,
+        "checkpoint_every_steps": args.checkpoint_every_steps,
+        "checkpoint_every_secs": args.checkpoint_every_secs,
+        "log_every_steps": args.log_every_steps,
+    });
+    let config_path = ctx.stage_dir.join("train_config.json");
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).map_err(
+        |source| StageError::Io {
+            path: config_path.clone(),
+            source,
+        },
+    )?;
+
+    let TrainerLaunch { cmdline, env } = trainer_command(ctx, args, &config_path)?;
+
+    // The trainer marks its progress `BLUT_STATUS <update>` on stdout; those
+    // lines go to the engine as this stage's progress (what `blut log` and
+    // `blut jobs` read), every other line to the terminal as before. The
+    // final loss it reports is the checkpoint's.
+    let forwarder = blut_backends::progress::Forwarder::new(ctx, stage_name);
+    let reported_loss = std::sync::Arc::new(std::sync::Mutex::new(None::<f32>));
+    let on_line = {
+        let reported_loss = reported_loss.clone();
+        move |line: &str| {
+            if let Some(StatusUpdate::Done { final_loss, .. }) = forwarder.relay_line(line) {
+                *reported_loss.lock().unwrap_or_else(|p| p.into_inner()) = Some(final_loss);
+            }
+        }
+    };
+    // Contained (memory cap, peak, tree kill on cancel or timeout); see local_stage.
+    let status = blut_backends::local_stage::run_reading_stdout(
+        ctx,
+        ctx.launch_target,
+        "blut-train_model",
+        &cmdline,
+        Some(&ctx.stage_dir),
+        &env,
+        on_line,
+    )
+    .await
+    .map_err(|e| match e {
+        StageError::Backend(e) => {
+            StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {e}"))
+        }
+        other => other,
+    })?;
+
+    if !status.success() {
+        return Err(StageError::Backend(anyhow::anyhow!(
+            "blut_core.trainer exited with {status}"
+        )));
+    }
+
+    // Verify output exists
+    if !output_dir.exists()
+        || output_dir
+            .read_dir()
+            .map_or(true, |mut d| d.next().is_none())
+    {
+        return Err(StageError::Backend(anyhow::anyhow!(
+            "trainer did not produce checkpoint in {}",
+            output_dir.display()
+        )));
+    }
+
+    let content_hash = ContentHash::hash_dir(&output_dir)
+        .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {e}")))?;
+
+    let reported_loss = *reported_loss.lock().unwrap_or_else(|p| p.into_inner());
+    Ok(HfCheckpoint {
+        path: output_dir,
+        base_model: args.model.name.clone(),
+        method_tag: "full".into(),
+        content_hash,
+        final_loss: blut_backends::progress::checkpoint_loss(stage_name, reported_loss),
+    })
 }
 
 /// The trainer process for one attempt, as a command line and its extra
@@ -378,7 +407,7 @@ impl Stage for TrainModelOnSplit {
                 input.train.n_examples
             )));
         }
-        TrainModel.run(ctx, input.train, args).await
+        train(ctx, input.train, args, Self::NAME).await
     }
 }
 
