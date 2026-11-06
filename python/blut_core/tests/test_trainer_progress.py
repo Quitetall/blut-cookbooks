@@ -58,8 +58,8 @@ def test_a_run_reports_its_steps_save_epoch_and_final_loss(tmp_path, capsys):
     out = capsys.readouterr().out
     model_pt = str(tmp_path / "out" / "model.pt")
     assert _relayed(out) == [
-        {"kind": "step", "step": 1, "total": 2, "loss": 1.0, "lr": 1e-3, "vram_mb": 0},
-        {"kind": "step", "step": 2, "total": 2, "loss": 3.0, "lr": 1e-3, "vram_mb": 0},
+        {"kind": "step", "step": 1, "total": 2, "loss": 1.0, "lr": 2e-4, "vram_mb": 0},
+        {"kind": "step", "step": 2, "total": 2, "loss": 3.0, "lr": 2e-4, "vram_mb": 0},
         {"kind": "heartbeat", "phase": "epoch 1/1 loss=2.0000"},
         {"kind": "saved", "path": model_pt},
         {"kind": "done", "final_loss": 2.0, "checkpoint_dir": str(tmp_path / "out")},

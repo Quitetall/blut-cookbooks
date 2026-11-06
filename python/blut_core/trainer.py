@@ -936,6 +936,12 @@ def train_loop(config: dict, ingredients: dict, dataset):
     try:
         # Training loop
         for epoch in range(start_epoch, epochs + 1):
+            # The LR for this epoch, set before it trains. Stepping only after
+            # an epoch left epoch 1 at the optimizer's peak LR, so a warmup
+            # began by dropping from the peak, one epoch late. Every rank.
+            if scheduler is not None:
+                scheduler.step(epoch)
+
             model.train()
             epoch_loss = 0.0
             n_batches = 0
@@ -1006,10 +1012,6 @@ def train_loop(config: dict, ingredients: dict, dataset):
                 raise RuntimeError(
                     f"epoch {epoch} ran zero batches; the dataset yielded nothing "
                     "to train on for this rank")
-
-            # Step scheduler (all ranks)
-            if scheduler is not None:
-                scheduler.step(epoch)
 
             avg_loss = epoch_loss / n_batches
 

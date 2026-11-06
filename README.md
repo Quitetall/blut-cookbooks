@@ -50,6 +50,12 @@ blut-core recipe run train_from_dataset --args '{
 
 `blut-core recipe show train_from_dataset` prints the full argument schema.
 
+The `constant`, `cosine`, `linear` and `wsd` schedulers set each epoch's learning
+rate before that epoch trains. Their warmup is in epochs and starts with the
+first one: `constant` defaults to `warmup_epochs: 5`, so the run above, at one
+epoch, trains at a fifth of the optimizer's `lr`. Set `"warmup_epochs": 0` for
+none.
+
 ## Guarding a dataset
 
 The engine's `check_jsonl` (row-count bounds) and `assert` (a scalar
