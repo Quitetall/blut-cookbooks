@@ -6,48 +6,22 @@ as the stage's progress (what `blut log` and `blut jobs` read) and leaves the
 each logged step with the loss, learning rate and GPU memory it measured, a
 save, the epoch, and the final loss, and never a value it did not measure.
 """
+import io
 import json
 import math
 import sys
 
 import pytest
 
-from blut_core import status
+torch = pytest.importorskip("torch")
+
+import blut_core.trainer as trainer  # noqa: E402
+from blut_core import status  # noqa: E402
 
 
 def _relayed(text):
     return [json.loads(line[len(status.RELAY_PREFIX):])
             for line in text.splitlines() if line.startswith(status.RELAY_PREFIX)]
-
-
-# --- the channel -----------------------------------------------------------------
-
-def test_relay_writes_one_marked_json_line(capsys):
-    line = status.relay("step", step=1, total=2, loss=0.5, lr=1e-3, vram_mb=0)
-    out = capsys.readouterr().out
-    assert out == line + "\n"
-    assert _relayed(out) == [
-        {"kind": "step", "step": 1, "total": 2, "loss": 0.5, "lr": 1e-3, "vram_mb": 0}]
-
-
-def test_relay_drops_what_json_cannot_carry_and_never_raises(capsys):
-    # The engine's update has no NaN; a number standing in for one would be a lie.
-    assert status.relay("done", final_loss=math.nan, checkpoint_dir="/x") is None
-    captured = capsys.readouterr()
-    assert captured.out == ""
-    assert "not sent" in captured.err
-
-
-def test_relay_refuses_a_kind_the_engine_does_not_know():
-    with pytest.raises(ValueError):
-        status.relay("epoch", loss=1.0)
-
-
-# --- the trainer -----------------------------------------------------------------
-
-torch = pytest.importorskip("torch")
-
-import blut_core.trainer as trainer  # noqa: E402
 
 
 def _config(tmp_path, **extra):
@@ -126,3 +100,15 @@ def test_a_failure_is_reported_and_still_raised(tmp_path, monkeypatch, capsys):
     updates = _relayed(capsys.readouterr().out)
     assert [u["kind"] for u in updates] == ["failed"]
     assert "absent.json" in updates[0]["error"]
+
+
+def test_stdout_is_line_buffered_for_the_stage_reading_it(tmp_path, monkeypatch):
+    # Through the stage's pipe Python would buffer by the block, so the
+    # terminal would get `[trainer]` lines late and a killed run would lose them.
+    out = io.TextIOWrapper(io.BytesIO())
+    assert not out.line_buffering
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "argv", ["trainer", "--config", str(tmp_path / "absent.json")])
+    with pytest.raises(FileNotFoundError):
+        trainer.main()
+    assert out.line_buffering

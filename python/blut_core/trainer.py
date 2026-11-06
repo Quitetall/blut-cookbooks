@@ -1113,6 +1113,12 @@ def train_loop(config: dict, ingredients: dict, dataset):
 # ---------------------------------------------------------------------------
 
 def main():
+    # `train_model` reads this stdout through a pipe, where Python buffers by
+    # the block: the `[trainer]` lines would reach the terminal late, and a
+    # killed run would lose them.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description="BLUT core generic trainer")
     parser.add_argument("--config", required=True, help="Path to ingredient config JSON")
     args = parser.parse_args()
