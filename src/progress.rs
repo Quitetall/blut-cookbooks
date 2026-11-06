@@ -44,29 +44,55 @@ impl Forwarder {
     /// Send `update` to the executor.
     pub fn send(&self, update: &StatusUpdate) {
         match serde_json::to_value(update) {
-            Ok(update) => {
-                // No subscriber (a stage run outside an executor) is not an error.
-                let _ = self.tx.send(StageEvent::StageStep {
-                    node_idx: self.node_idx,
-                    stage_name: self.stage_name.to_string(),
-                    update,
-                });
-            }
-            Err(e) => tracing::warn!(
-                "{}: cannot serialize a trainer update: {e}",
-                self.stage_name
-            ),
+            Ok(update) => self.send_value(update),
+            Err(e) => self.warn_unserializable(&e),
         }
     }
 
+    /// [`send`](Self::send), with a non-finite measurement beside the update
+    /// as `metric: "nan"` (or `"inf"`, `"-inf"`). JSON has no such number and
+    /// `StatusUpdate` no such field, and this string is how the engine takes
+    /// one: `StepMetrics::has_non_finite` and the HPO objective both read it,
+    /// so a diverged trial is killed, while `read_status` ignores the extra
+    /// key and still reads the update.
+    pub fn send_non_finite(&self, update: &StatusUpdate, metric: &str, value: &str) {
+        match serde_json::to_value(update) {
+            Ok(mut update) => {
+                update[metric] = value.into();
+                self.send_value(update);
+            }
+            Err(e) => self.warn_unserializable(&e),
+        }
+    }
+
+    fn send_value(&self, update: serde_json::Value) {
+        // No subscriber (a stage run outside an executor) is not an error.
+        let _ = self.tx.send(StageEvent::StageStep {
+            node_idx: self.node_idx,
+            stage_name: self.stage_name.to_string(),
+            update,
+        });
+    }
+
+    fn warn_unserializable(&self, error: &serde_json::Error) {
+        tracing::warn!(
+            "{}: cannot serialize a trainer update: {error}",
+            self.stage_name
+        );
+    }
+
     /// One line of the trainer's stdout. A [`STATUS_PREFIX`] line is forwarded
-    /// and returned; any other line, or a marked line that is not a valid
-    /// update, is printed to this process's stdout unchanged.
+    /// as written, keys `StatusUpdate` does not have included (a divergence
+    /// token, see [`send_non_finite`](Self::send_non_finite)), and returned;
+    /// any other line, or a marked line that is not a valid update, is printed
+    /// to this process's stdout unchanged.
     pub fn relay_line(&self, line: &str) -> Option<StatusUpdate> {
         if let Some(json) = line.strip_prefix(STATUS_PREFIX) {
-            match serde_json::from_str::<StatusUpdate>(json) {
-                Ok(update) => {
-                    self.send(&update);
+            match serde_json::from_str::<serde_json::Value>(json).and_then(|raw| {
+                serde_json::from_value::<StatusUpdate>(raw.clone()).map(|typed| (raw, typed))
+            }) {
+                Ok((raw, update)) => {
+                    self.send_value(raw);
                     return Some(update);
                 }
                 Err(e) => tracing::warn!(
@@ -138,6 +164,34 @@ mod tests {
             assert_eq!(fwd.relay_line(line), None, "{line}");
         }
         assert!(rx.try_recv().is_err(), "nothing forwarded");
+    }
+
+    /// A diverged trainer's update keeps its token through the relay, so the
+    /// engine's kill path sees it, and stays a heartbeat for `read_status`.
+    #[test]
+    fn a_divergence_token_survives_the_relay_and_trips_the_engines_checks() {
+        use blut::framework::control::{Control, ControlPolicy, KillOnNaN, StepMetrics};
+        let (fwd, mut rx) = forwarder();
+        let got = fwd.relay_line(
+            r#"BLUT_STATUS {"kind":"heartbeat","phase":"step 2/8 loss=nan","vram_mb":0,"loss":"nan"}"#,
+        );
+        assert!(matches!(got, Some(StatusUpdate::Heartbeat { .. })));
+        let StageEvent::StageStep { update, .. } = rx.try_recv().unwrap() else {
+            panic!("expected a StageStep");
+        };
+        let metrics = StepMetrics {
+            node_idx: 5,
+            stage_name: "train_model",
+            update: &update,
+        };
+        assert!(metrics.has_non_finite());
+        assert_eq!(KillOnNaN.on_step(&metrics), Control::KillBranch);
+        let objective = blut::hpo::scheduler::dotted_f64(&update, "loss").unwrap();
+        assert!(!objective.is_finite(), "the HPO scheduler's kill condition");
+        assert!(matches!(
+            serde_json::from_value::<StatusUpdate>(update).unwrap(),
+            StatusUpdate::Heartbeat { .. }
+        ));
     }
 
     /// The prefix is a contract with the Python runtime the trainer uses.

@@ -50,6 +50,12 @@ blut-core recipe run train_from_dataset --args '{
 
 `blut-core recipe show train_from_dataset` prints the full argument schema.
 
+The `constant`, `cosine`, `linear` and `wsd` schedulers set each epoch's learning
+rate before that epoch trains. Their warmup is in epochs and starts with the
+first one: `constant` defaults to `warmup_epochs: 5`, so the run above, at one
+epoch, trains at a fifth of the optimizer's `lr`. Set `"warmup_epochs": 0` for
+none.
+
 ## Guarding a dataset
 
 The engine's `check_jsonl` (row-count bounds) and `assert` (a scalar
@@ -136,7 +142,12 @@ engine's trainer format. `vram` is the GPU memory the trainer's process holds
   step reports no final loss.
 
 A step whose loss is not a finite number, or whose learning rate cannot be
-read, appears as `… step N/M` as well.
+read, appears as `… step N/M` as well. A non-finite loss from `train_model`, or
+from the HF stages, also carries the string `"nan"`, `"inf"` or `"-inf"` on the
+forwarded update. That is how the engine recognizes a diverged run: `blut hpo`
+kills such a trial, and so does any plan under `BLUT_EXECUTOR=parallel` with
+`BLUT_KILL_ON_NAN=1`. It is seen when a loss is logged: at `log_every_steps`,
+otherwise at the end of the epoch.
 
 The checkpoint these stages produce records the final loss the trainer
 reported, or none when it reported none (a run that trained no step).

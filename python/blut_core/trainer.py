@@ -86,11 +86,30 @@ def _vram_mb(device) -> int:
 def _report_step(step: int, total: int, loss: float, lr, vram_mb: int) -> None:
     """One logged step. The engine's step update needs a finite loss and a
     learning rate; a step without them is reported as a heartbeat that names
-    it, never with a value filled in."""
-    if lr is not None and math.isfinite(loss) and math.isfinite(lr):
+    it, never with a value filled in.
+
+    A non-finite loss also goes as the string ``loss: "nan"`` (or ``"inf"``,
+    ``"-inf"``). JSON has no such number, and the string is how the engine
+    takes one: ``KillOnNaN`` and the HPO scheduler kill a diverged trial on it,
+    and ``blut log`` still reads the update as a heartbeat."""
+    phase = f"step {step}/{total} loss={loss}"
+    if not math.isfinite(loss):
+        status.relay("heartbeat", phase=phase, vram_mb=vram_mb, loss=str(loss))
+    elif lr is not None and math.isfinite(lr):
         status.relay("step", step=step, total=total, loss=loss, lr=lr, vram_mb=vram_mb)
     else:
-        status.relay("heartbeat", phase=f"step {step}/{total} loss={loss}", vram_mb=vram_mb)
+        status.relay("heartbeat", phase=phase, vram_mb=vram_mb)
+
+
+def _report_epoch(epoch: int, epochs: int, loss: float) -> None:
+    """One finished epoch, its mean loss in the label. A non-finite mean goes
+    as in ``_report_step``: with no step logging this is where a diverged run
+    is first seen."""
+    phase = f"epoch {epoch}/{epochs} loss={loss:.4f}"
+    if math.isfinite(loss):
+        status.relay("heartbeat", phase=phase)
+    else:
+        status.relay("heartbeat", phase=phase, loss=str(loss))
 
 
 def _ddp_device(device: str) -> str:
@@ -936,6 +955,12 @@ def train_loop(config: dict, ingredients: dict, dataset):
     try:
         # Training loop
         for epoch in range(start_epoch, epochs + 1):
+            # The LR for this epoch, set before it trains. Stepping only after
+            # an epoch left epoch 1 at the optimizer's peak LR, so a warmup
+            # began by dropping from the peak, one epoch late. Every rank.
+            if scheduler is not None:
+                scheduler.step(epoch)
+
             model.train()
             epoch_loss = 0.0
             n_batches = 0
@@ -1007,10 +1032,6 @@ def train_loop(config: dict, ingredients: dict, dataset):
                     f"epoch {epoch} ran zero batches; the dataset yielded nothing "
                     "to train on for this rank")
 
-            # Step scheduler (all ranks)
-            if scheduler is not None:
-                scheduler.step(epoch)
-
             avg_loss = epoch_loss / n_batches
 
             # Reduce avg_loss across DDP ranks for consistent reporting
@@ -1033,7 +1054,7 @@ def train_loop(config: dict, ingredients: dict, dataset):
                     metrics["lr"] = scheduler.get_last_lr()[0]
                 emit(metrics, kind="epoch")
                 print(f"[trainer] epoch {epoch}/{epochs}: loss={avg_loss:.4f}")
-                status.relay("heartbeat", phase=f"epoch {epoch}/{epochs} loss={avg_loss:.4f}")
+                _report_epoch(epoch, epochs, avg_loss)
                 final_loss = avg_loss
     finally:
         # Stop the heartbeat however the loop ends. After a failure the marker

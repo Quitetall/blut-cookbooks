@@ -30,8 +30,15 @@ pub(crate) fn forward_status(
 ) -> Box<dyn Fn(StatusLine) + Send + Sync> {
     let forwarder = crate::progress::Forwarder::new(ctx, stage_name);
     Box::new(move |line: StatusLine| {
-        if let Some(update) = line.status_update() {
-            forwarder.send(&update);
+        let Some(update) = line.status_update() else {
+            return;
+        };
+        match &line {
+            // The engine's kill path reads the token beside the update.
+            StatusLine::Diverged { metric, value, .. } => {
+                forwarder.send_non_finite(&update, metric, value);
+            }
+            _ => forwarder.send(&update),
         }
     })
 }
@@ -234,6 +241,38 @@ mod tests {
         assert!(log.contains("step 4/4  loss=1.5000"), "{log}");
         assert!(log.contains("eval @4  loss=1.9000"), "{log}");
         assert!(log.contains("done  final_loss=1.7500"), "{log}");
+    }
+
+    /// A loss HF logged as NaN reaches the engine's divergence check, and
+    /// `blut log` still shows the step.
+    #[test]
+    fn a_diverged_line_trips_the_engines_check() {
+        use blut::framework::control::StepMetrics;
+        use blut::framework::status::StageEvent;
+
+        let ctx = StageContext::for_test("/tmp/j".into(), "/tmp/j/s".into());
+        let mut rx = ctx.status_tx.subscribe();
+        let cb = super::forward_status(&ctx, "hf_sft_train");
+        cb(serde_json::from_str(
+            r#"{"kind":"diverged","step":6,"total":10,"metric":"loss","value":"nan"}"#,
+        )
+        .unwrap());
+        let StageEvent::StageStep { update, .. } = rx.try_recv().unwrap() else {
+            panic!("expected a StageStep");
+        };
+        let metrics = StepMetrics {
+            node_idx: 0,
+            stage_name: "hf_sft_train",
+            update: &update,
+        };
+        assert!(metrics.has_non_finite(), "{update}");
+        assert_eq!(
+            serde_json::from_value::<StatusUpdate>(update).unwrap(),
+            StatusUpdate::Heartbeat {
+                phase: Some("step 6/10 loss=nan".into()),
+                vram_mb: None,
+            }
+        );
     }
 
     #[tokio::test]

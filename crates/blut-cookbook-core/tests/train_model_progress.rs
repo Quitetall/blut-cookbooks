@@ -37,7 +37,7 @@ echo 'BLUT_METRIC {"step": 1, "loss": 2.5, "epoch": 1, "kind": "step"}'
 echo "[trainer] step 1/2 loss=2.5000"
 echo 'BLUT_STATUS {"kind":"step","step":1,"total":2,"loss":2.5,"lr":0.001,"vram_mb":0}'
 echo "[trainer] step 2/2 loss=nan"
-echo 'BLUT_STATUS {"kind":"heartbeat","phase":"step 2/2 loss=nan","vram_mb":0}'
+echo 'BLUT_STATUS {"kind":"heartbeat","phase":"step 2/2 loss=nan","vram_mb":0,"loss":"nan"}'
 echo "[trainer] epoch 1/1: loss=2.0000"
 echo 'BLUT_STATUS {"kind":"heartbeat","phase":"epoch 1/1 loss=2.0000"}'
 echo weights > "$out/model.pt"

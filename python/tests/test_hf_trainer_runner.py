@@ -81,6 +81,19 @@ def test_vram_is_zero_off_the_gpu_and_measured_on_it(runner, monkeypatch):
     assert runner._vram_mb() == 0
 
 
+@pytest.mark.parametrize("metric", ["loss", "eval_loss"])
+@pytest.mark.parametrize("value, token", [
+    (float("nan"), "nan"), (float("inf"), "inf"), (float("-inf"), "-inf")])
+def test_a_non_finite_loss_is_a_diverged_line(runner, metric, value, token):
+    lines = runner._LogLines()
+    lines.total = 10
+    out = lines.lines({metric: value, "learning_rate": 1e-4}, 5)
+    assert out == [{"kind": "diverged", "step": 5, "total": 10,
+                    "metric": metric, "value": token}]
+    json.dumps(out, allow_nan=False)  # valid JSON, unlike a bare NaN
+    assert lines.last_loss is None
+
+
 def test_a_log_event_becomes_its_status_lines(runner, monkeypatch):
     # HF logs training, evaluation and the end-of-run summary through one
     # callback. An evaluation is the engine's `eval` update; the others are
