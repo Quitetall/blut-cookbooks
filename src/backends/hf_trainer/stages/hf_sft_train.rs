@@ -195,7 +195,7 @@ impl Stage for HfSftTrain {
             base_model: args.base_model.clone(),
             method_tag: args.method.clone(),
             content_hash,
-            final_loss: crate::progress::checkpoint_loss(HfSftTrain::NAME, result.final_loss),
+            final_loss: result.final_loss,
         })
     }
 }
@@ -279,6 +279,27 @@ mod tests {
     #[test]
     fn deterministic_false() {
         const { assert!(!<HfSftTrain as Stage>::DETERMINISTIC) };
+    }
+
+    /// An absent final loss survives both ways the engine carries a stage's
+    /// output: the JSON projection that rebases its paths, and the erased
+    /// bincode payload. A `NaN` standing in for "none" would break the first;
+    /// `skip_serializing_if` on the field would break the second.
+    #[test]
+    fn an_absent_final_loss_survives_the_engines_output_handling() {
+        let ckpt = HfCheckpoint {
+            path: "/c".into(),
+            base_model: "m".into(),
+            method_tag: "full".into(),
+            content_hash: ContentHash::of_bytes(b""),
+            final_loss: None,
+        };
+        let json = serde_json::to_value(&ckpt).unwrap();
+        let back: HfCheckpoint = serde_json::from_value(json).unwrap();
+        assert_eq!(back.final_loss, None);
+        let erased = blut::framework::stage::ErasedArtifact::from_typed(&ckpt).unwrap();
+        let back: HfCheckpoint = erased.into_typed().unwrap();
+        assert_eq!(back.final_loss, None);
     }
 
     fn minimal_args() -> serde_json::Value {

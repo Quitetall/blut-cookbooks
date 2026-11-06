@@ -111,7 +111,7 @@ mod tests {
             base_model: "Qwen/Qwen3-7B".into(),
             method_tag: "qlora_merged".into(),
             content_hash: ContentHash([byte; 32]),
-            final_loss: 0.4,
+            final_loss: Some(0.4),
         }
     }
     fn ds() -> DatasetJsonl {

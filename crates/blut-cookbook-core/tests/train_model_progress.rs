@@ -89,11 +89,13 @@ impl Drop for EnvVars {
     }
 }
 
-/// Run `stage` against the stub; return the updates `read_status` reads back,
-/// the job's `list_jobs` row, `tail_log`'s rendering, and the checkpoint.
+/// Run `stage` against the stub `trainer`; return the updates `read_status`
+/// reads back, the job's `list_jobs` row, `tail_log`'s rendering, and the
+/// checkpoint.
 #[allow(clippy::await_holding_lock)]
 async fn run_with_stub(
     stage: &'static str,
+    trainer: &str,
 ) -> (
     Vec<StatusUpdate>,
     blut::jobs::JobSummary,
@@ -103,7 +105,7 @@ async fn run_with_stub(
     let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let td = tempfile::tempdir().unwrap();
     let stub = td.path().join("python");
-    executable(&stub, TRAINER_STDOUT);
+    executable(&stub, trainer);
     let jobs = td.path().join("jobs");
     let _env = EnvVars::set(&[("BLUT_PYTHON", &stub), ("LAMU_TRAIN_JOBS_DIR", &jobs)]);
 
@@ -206,17 +208,31 @@ fn assert_progress_is_visible(
     // The terminal's lines are not progress.
     assert!(!log.contains("[trainer]"), "{log}");
     // The checkpoint records the loss the trainer reported, not 0.0.
-    assert_eq!(ckpt.final_loss, 2.0);
+    assert_eq!(ckpt.final_loss, Some(2.0));
 }
 
 #[tokio::test]
 async fn train_model_progress_reaches_blut_log_and_blut_jobs() {
-    let (updates, summary, log, ckpt) = run_with_stub("train_model").await;
+    let (updates, summary, log, ckpt) = run_with_stub("train_model", TRAINER_STDOUT).await;
     assert_progress_is_visible(&updates, &summary, &log, &ckpt);
 }
 
 #[tokio::test]
 async fn train_model_on_split_progress_is_its_own() {
-    let (updates, summary, log, ckpt) = run_with_stub("train_model_on_split").await;
+    let (updates, summary, log, ckpt) = run_with_stub("train_model_on_split", TRAINER_STDOUT).await;
     assert_progress_is_visible(&updates, &summary, &log, &ckpt);
+}
+
+/// An attempt that trained no epoch reports no `done`: the checkpoint records
+/// no final loss rather than a made-up one.
+#[tokio::test]
+async fn a_run_that_reports_no_final_loss_records_none() {
+    let trainer = TRAINER_STDOUT
+        .lines()
+        .filter(|l| !l.contains("done"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (_, summary, _, ckpt) = run_with_stub("train_model", &trainer).await;
+    assert_eq!(ckpt.final_loss, None);
+    assert_eq!(summary.final_loss, None);
 }

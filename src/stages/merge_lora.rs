@@ -108,7 +108,7 @@ mod tests {
             base_model: "Qwen/Qwen3-7B".into(),
             method_tag: method.into(),
             content_hash: ContentHash::of_bytes(b"x"),
-            final_loss: 0.5,
+            final_loss: Some(0.5),
         }
     }
 

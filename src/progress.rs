@@ -82,54 +82,9 @@ impl Forwarder {
     }
 }
 
-/// The `final_loss` an `HfCheckpoint` records, from the loss the trainer
-/// reported (`None` when it reported none: a run that trained no step).
-///
-/// `blut::artifacts::HfCheckpoint::final_loss` is an `f32`, so a missing loss
-/// cannot be recorded as missing. It is recorded as 0.0, as before, with a
-/// warning saying so. NaN is no way out: the engine projects every stage
-/// output through JSON to rebase its paths, and NaN does not survive that
-/// (JSON has none), so the projection would fail. Recording the absence needs
-/// the engine field to become `Option<f32>`.
-pub fn checkpoint_loss(stage_name: &str, reported: Option<f32>) -> f32 {
-    reported.unwrap_or_else(|| {
-        tracing::warn!(
-            "{stage_name}: the trainer reported no final loss; the checkpoint records \
-             final_loss 0.0 only because HfCheckpoint.final_loss must be a number"
-        );
-        0.0
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_reported_loss_is_the_checkpoints() {
-        assert_eq!(checkpoint_loss("s", Some(1.25)), 1.25);
-        assert_eq!(checkpoint_loss("s", None), 0.0);
-    }
-
-    /// Why a missing loss is not recorded as NaN: the engine rebases a stage
-    /// output's paths through a JSON round trip, which NaN fails.
-    #[test]
-    fn a_nan_final_loss_would_not_survive_the_engines_output_projection() {
-        let ckpt = |final_loss| blut::artifacts::HfCheckpoint {
-            path: "/c".into(),
-            base_model: "m".into(),
-            method_tag: "full".into(),
-            content_hash: blut::framework::artifact::ContentHash::of_bytes(b""),
-            final_loss,
-        };
-        let round_trip = |c: blut::artifacts::HfCheckpoint| {
-            serde_json::from_value::<blut::artifacts::HfCheckpoint>(
-                serde_json::to_value(c).unwrap(),
-            )
-        };
-        assert!(round_trip(ckpt(0.0)).is_ok());
-        assert!(round_trip(ckpt(f32::NAN)).is_err());
-    }
 
     fn forwarder() -> (Forwarder, tokio::sync::broadcast::Receiver<StageEvent>) {
         let mut ctx = StageContext::for_test("/tmp/j".into(), "/tmp/j/s".into());
