@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use blut::artifacts::DatasetJsonl;
+use blut::artifacts::{DatasetJsonl, HfCheckpoint};
 use blut::framework::artifact::ContentHash;
 use blut::framework::stage::{Stage, StageContext};
 use blut::framework::status::{StatusHub, spawn_status_writer_checked};
@@ -90,8 +90,7 @@ impl Drop for EnvVars {
 }
 
 /// Run `stage` against the stub; return the updates `read_status` reads back,
-/// the job's `list_jobs` row, and `tail_log`'s rendering, with the checkpoint
-/// directory and the stage's node index.
+/// the job's `list_jobs` row, `tail_log`'s rendering, and the checkpoint.
 #[allow(clippy::await_holding_lock)]
 async fn run_with_stub(
     stage: &'static str,
@@ -99,7 +98,7 @@ async fn run_with_stub(
     Vec<StatusUpdate>,
     blut::jobs::JobSummary,
     String,
-    std::path::PathBuf,
+    HfCheckpoint,
 ) {
     let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let td = tempfile::tempdir().unwrap();
@@ -159,15 +158,16 @@ async fn run_with_stub(
             "{l}"
         );
     }
-    (updates, summary, log, ckpt.path)
+    (updates, summary, log, ckpt)
 }
 
 fn assert_progress_is_visible(
     updates: &[StatusUpdate],
     summary: &blut::jobs::JobSummary,
     log: &str,
-    ckpt: &Path,
+    ckpt: &HfCheckpoint,
 ) {
+    let dir = ckpt.path.as_path();
     assert_eq!(
         updates,
         [
@@ -187,11 +187,11 @@ fn assert_progress_is_visible(
                 vram_mb: None,
             },
             StatusUpdate::Saved {
-                path: ckpt.join("model.pt"),
+                path: dir.join("model.pt"),
             },
             StatusUpdate::Done {
                 final_loss: 2.0,
-                checkpoint_dir: ckpt.to_path_buf(),
+                checkpoint_dir: dir.to_path_buf(),
             },
         ]
     );
@@ -205,6 +205,8 @@ fn assert_progress_is_visible(
     assert!(log.contains("done  final_loss=2.0000"), "{log}");
     // The terminal's lines are not progress.
     assert!(!log.contains("[trainer]"), "{log}");
+    // The checkpoint records the loss the trainer reported, not 0.0.
+    assert_eq!(ckpt.final_loss, 2.0);
 }
 
 #[tokio::test]

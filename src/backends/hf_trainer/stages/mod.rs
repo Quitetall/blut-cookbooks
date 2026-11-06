@@ -165,6 +165,8 @@ mod tests {
         std::fs::create_dir_all(&ctx.stage_dir).unwrap();
         let out = run(ctx, root).await.expect("the stage completes");
         assert_eq!(out.path, ckpt);
+        // The checkpoint records the final loss the trainer reported.
+        assert_eq!(out.final_loss, 1.75);
         drop(hub);
         writer.await.unwrap().expect("status.jsonl written");
 

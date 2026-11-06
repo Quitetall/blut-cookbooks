@@ -16,6 +16,7 @@ use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
+use blut::protocol::StatusUpdate;
 
 use super::shared::IngredientCfg;
 use blut::config::launcher::LaunchTarget;
@@ -243,10 +244,17 @@ async fn train(
 
     // The trainer marks its progress `BLUT_STATUS <update>` on stdout; those
     // lines go to the engine as this stage's progress (what `blut log` and
-    // `blut jobs` read), every other line to the terminal as before.
+    // `blut jobs` read), every other line to the terminal as before. The
+    // final loss it reports is the checkpoint's.
     let forwarder = blut_backends::progress::Forwarder::new(ctx, stage_name);
-    let on_line = move |line: &str| {
-        forwarder.relay_line(line);
+    let reported_loss = std::sync::Arc::new(std::sync::Mutex::new(None::<f32>));
+    let on_line = {
+        let reported_loss = reported_loss.clone();
+        move |line: &str| {
+            if let Some(StatusUpdate::Done { final_loss, .. }) = forwarder.relay_line(line) {
+                *reported_loss.lock().unwrap_or_else(|p| p.into_inner()) = Some(final_loss);
+            }
+        }
     };
     // Contained (memory cap, peak, tree kill on cancel or timeout); see local_stage.
     let status = blut_backends::local_stage::run_reading_stdout(
@@ -287,12 +295,13 @@ async fn train(
     let content_hash = ContentHash::hash_dir(&output_dir)
         .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {e}")))?;
 
+    let reported_loss = *reported_loss.lock().unwrap_or_else(|p| p.into_inner());
     Ok(HfCheckpoint {
         path: output_dir,
         base_model: args.model.name.clone(),
         method_tag: "full".into(),
         content_hash,
-        final_loss: 0.0, // filled by trainer
+        final_loss: blut_backends::progress::checkpoint_loss(stage_name, reported_loss),
     })
 }
 

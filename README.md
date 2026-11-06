@@ -138,6 +138,11 @@ engine's trainer format. `vram` is the GPU memory the trainer's process holds
 A step whose loss is not a finite number, or whose learning rate cannot be
 read, appears as `… step N/M` as well.
 
+The checkpoint these stages produce records the final loss the trainer
+reported. When it reported none (a run that trained no step), the checkpoint
+still records 0.0, with a warning in the log: the engine's `HfCheckpoint`
+requires a number there.
+
 ## Resuming an interrupted training stage
 
 With BLUT 0.2.0-alpha.2 or later, `train_model` and `train_model_on_split`

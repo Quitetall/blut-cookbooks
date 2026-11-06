@@ -195,7 +195,7 @@ impl Stage for HfSftTrain {
             base_model: args.base_model.clone(),
             method_tag: args.method.clone(),
             content_hash,
-            final_loss: result.final_loss.unwrap_or(0.0),
+            final_loss: crate::progress::checkpoint_loss(HfSftTrain::NAME, result.final_loss),
         })
     }
 }
