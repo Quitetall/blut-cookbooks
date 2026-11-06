@@ -14,6 +14,7 @@ status event on stdout. Stderr is free-form.
 Wire schema (matches `runner::StatusLine`):
   {"kind":"step","step":int,"total":int,"loss":float,"lr":float,"vram_mb":int}
   {"kind":"eval","step":int,"eval_loss":float}
+  {"kind":"diverged","step":int,"total":int,"metric":str,"value":"nan"|"inf"|"-inf"}
   {"kind":"saved","path":str}
   {"kind":"done","checkpoint_dir":str,"final_loss":float}
   {"kind":"failed","error":str}
@@ -26,6 +27,7 @@ listed in `runner::REQUIRED_PKGS`. New dep = bump
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import traceback
@@ -73,6 +75,13 @@ class _LogLines:
         from a training log, the learning rate; a log that has neither (the
         end-of-run summary) leaves them null."""
         logs = logs or {}
+        for metric in ("loss", "eval_loss"):
+            if metric in logs and not math.isfinite(float(logs[metric])):
+                # JSON has no NaN. A line naming it reaches the engine's
+                # divergence check; `json.dumps` would write a bare NaN, which
+                # the runner cannot parse and drops.
+                return [{"kind": "diverged", "step": step, "total": self.total,
+                         "metric": metric, "value": str(float(logs[metric]))}]
         out: List[Dict[str, Any]] = []
         if "eval_loss" in logs:
             out.append({"kind": "eval", "step": step, "eval_loss": float(logs["eval_loss"])})

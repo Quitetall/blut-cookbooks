@@ -83,12 +83,27 @@ def test_an_unmeasured_value_is_never_filled_in(tmp_path, capsys):
     trainer.train_loop(
         _config(tmp_path, log_every_steps=1), _ingredients([1.0, math.nan]), rows)
     updates = _relayed(capsys.readouterr().out)
-    assert updates[1] == {"kind": "heartbeat", "phase": "step 2/2 loss=nan", "vram_mb": 0}
+    assert updates[1] == {"kind": "heartbeat", "phase": "step 2/2 loss=nan", "vram_mb": 0,
+                          "loss": "nan"}
+    assert updates[2] == {"kind": "heartbeat", "phase": "epoch 1/1 loss=nan", "loss": "nan"}
     assert [u["kind"] for u in updates] == ["step", "heartbeat", "heartbeat", "saved"]
+
+
+@pytest.mark.parametrize("value, token", [(math.inf, "inf"), (-math.inf, "-inf")])
+def test_an_infinite_loss_is_named_as_the_engine_reads_it(value, token, capsys):
+    trainer._report_step(3, 8, value, 1e-3, 0)
+    assert _relayed(capsys.readouterr().out)[0]["loss"] == token
+
+
+def test_without_step_logging_a_diverged_epoch_is_still_reported(tmp_path, capsys):
+    rows = [{"x": i} for i in range(4)]
+    trainer.train_loop(_config(tmp_path), _ingredients([1.0, math.nan]), rows)
+    assert _relayed(capsys.readouterr().out)[0]["loss"] == "nan"
 
 
 def test_an_optimizer_without_a_learning_rate_reports_a_heartbeat(capsys):
     trainer._report_step(3, 8, 0.25, None, 0)
+    # The loss is finite, so no divergence token.
     assert _relayed(capsys.readouterr().out) == [
         {"kind": "heartbeat", "phase": "step 3/8 loss=0.25", "vram_mb": 0}]
 

@@ -10,6 +10,7 @@
 //!   - Stdout: one JSON line per status event. Schema:
 //!     `{"kind": "step", "step": int, "total": int, "loss": f, "lr": f, "vram_mb": int}`
 //!     `{"kind": "eval", "step": int, "eval_loss": f}`
+//!     `{"kind": "diverged", "step": int, "total": int, "metric": str, "value": str}`
 //!     `{"kind": "saved", "path": str}`
 //!     `{"kind": "done", "checkpoint_dir": str, "final_loss": f}`
 //!     `{"kind": "failed", "error": str}`
@@ -138,6 +139,14 @@ pub enum StatusLine {
         step: u64,
         eval_loss: f32,
     },
+    /// A logged loss was not finite. `value` is `nan`, `inf` or `-inf`: JSON
+    /// has no such number.
+    Diverged {
+        step: u64,
+        total: u64,
+        metric: String,
+        value: String,
+    },
     Saved {
         path: PathBuf,
     },
@@ -191,6 +200,15 @@ impl StatusLine {
             StatusLine::Eval { step, eval_loss } => StatusUpdate::Eval {
                 step: count(*step),
                 eval_loss: *eval_loss,
+            },
+            StatusLine::Diverged {
+                step,
+                total,
+                metric,
+                value,
+            } => StatusUpdate::Heartbeat {
+                phase: Some(format!("step {step}/{total} {metric}={value}")),
+                vram_mb: None,
             },
             StatusLine::Saved { path } => StatusUpdate::Saved { path: path.clone() },
             StatusLine::Done {
