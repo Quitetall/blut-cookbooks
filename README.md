@@ -27,7 +27,7 @@ PYTHONPATH=python python -m pytest -q python
 
 CI runs both, plus `rustfmt`, `clippy -D warnings`, `cargo-deny` (advisories,
 licenses, sources), and a compile check on the declared minimum Rust
-version, 1.88.
+version, 1.99.
 
 ## Train a model
 

@@ -19,7 +19,7 @@ edition = "2024"
 authors = ["Brian Lam"]
 license = "Apache-2.0"
 description = "Generic-LLM cookbook layer for BLUT — concrete stages + lamu/hf_trainer backends extracted from the engine."
-rust-version = "1.88"
+rust-version = "1.99"
 repository = "https://github.com/Quitetall/blut-cookbooks"
 
 [lib]

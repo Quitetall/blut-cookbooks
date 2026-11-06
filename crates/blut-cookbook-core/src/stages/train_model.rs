@@ -350,10 +350,11 @@ fn trainer_command(
     // must be the card the scheduler actually granted.
     // Under Slurm the allocation assigns devices, so only a local run pins.
     let mut env = Vec::new();
-    if nproc <= 1 && ctx.launch_target == LaunchTarget::Local {
-        if let Some(dev) = ctx.device_index {
-            env.push(("CUDA_VISIBLE_DEVICES".to_string(), dev.to_string()));
-        }
+    if nproc <= 1
+        && ctx.launch_target == LaunchTarget::Local
+        && let Some(dev) = ctx.device_index
+    {
+        env.push(("CUDA_VISIBLE_DEVICES".to_string(), dev.to_string()));
     }
     // The checkpoint slot (engine CONTRACT.md §8): where to checkpoint and
     // whether to resume. `srun` and `torchrun` hand it to every rank.

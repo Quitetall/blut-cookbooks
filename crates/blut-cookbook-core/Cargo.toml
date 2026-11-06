@@ -12,7 +12,7 @@ edition = "2024"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "Core BLUT cookbook — generic ML training primitives (data/optimizer/scheduler/loss/checkpoint)."
-rust-version = "1.85"
+rust-version = "1.99"
 repository = "https://github.com/Quitetall/blut-cookbooks"
 
 [lib]
