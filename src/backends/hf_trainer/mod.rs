@@ -11,10 +11,15 @@
 //! machinery can name `HfTrainerBackend` at compile time
 //! everywhere it needs to without forward-declaring.
 
+pub mod image_text;
 pub mod runner;
 pub mod stages;
 pub mod venv;
 
+pub use image_text::{ARCH_CAUSAL_LM, ARCH_IMAGE_TEXT, ImageTextOpts};
 pub use runner::{DpoConfig, HfRunArtifact, HfTrainerJob, HfTrainerRunner, PeftConfig, StatusLine};
 pub use stages::{HfDpoTrain, HfSftTrain};
-pub use venv::{VenvError, ensure_venv, venv_root};
+pub use venv::{
+    CAUSAL_LM_PROFILE, IMAGE_TEXT_PROFILE, VenvError, VenvProfile, ensure_venv,
+    ensure_venv_profile, venv_root,
+};

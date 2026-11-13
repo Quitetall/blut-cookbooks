@@ -16,6 +16,8 @@ Wire schema (matches `runner::StatusLine`):
   {"kind":"saved","path":str}
   {"kind":"done","checkpoint_dir":str,"final_loss":float}
   {"kind":"failed","error":str}
+  image_text adds optional step fields `grad_norm`, `tokens_per_second`, and
+  {"kind":"resumed","step":int,"path":str}.
 
 Auto-managed venv contract: this script only imports packages
 listed in `runner::REQUIRED_PKGS`. New dep = bump
@@ -352,9 +354,24 @@ def main() -> int:
         fail("usage: hf_trainer_runner.py <job_spec.json>")
     spec = load_spec(Path(sys.argv[1]))
     task = spec.get("task", "sft")
+    arch = spec.get("arch") or "causal_lm"
 
     try:
-        if task in ("sft", "distill"):
+        if arch not in ("causal_lm", "image_text"):
+            fail(f"unknown arch: {arch}")
+        if arch == "image_text":
+            # Own module, own venv profile (transformers 5.x). The causal_lm
+            # paths below are untouched.
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import hf_image_text_train
+
+            if task == "sft":
+                hf_image_text_train.run(spec, emit)
+            elif task == "merge":
+                hf_image_text_train.run_merge(spec, emit)
+            else:
+                fail(f"task {task!r} is not supported for arch image_text")
+        elif task in ("sft", "distill"):
             run_sft(spec)
         elif task == "dpo":
             run_dpo(spec)

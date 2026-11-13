@@ -135,6 +135,7 @@ impl Stage for HfDpoTrain {
             }),
             nproc_per_node: args.nproc_per_node,
             nnodes: args.nnodes,
+            opts: Default::default(),
         };
 
         let status_tx = ctx.status_tx.clone();
@@ -145,6 +146,7 @@ impl Stage for HfDpoTrain {
                 total,
                 loss,
                 lr,
+                ..
             } => {
                 let _ = status_tx.send(StageEvent::StageStep {
                     node_idx,

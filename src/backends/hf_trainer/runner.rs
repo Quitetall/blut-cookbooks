@@ -31,7 +31,8 @@ use tokio::process::Command;
 
 use blut::python_kill::graceful_kill_pid;
 
-use super::venv::{VenvError, ensure_venv};
+use super::image_text::ImageTextOpts;
+use super::venv::{IMAGE_TEXT_PROFILE, VenvError, ensure_venv, ensure_venv_profile};
 
 /// Typed job spec the Rust side hands the Python wrapper. Mirrors
 /// `transformers.TrainingArguments` for the canonical fields +
@@ -78,6 +79,10 @@ pub struct HfTrainerJob {
     /// the wrapper then also saves a checkpoint on each node.
     #[serde(default = "crate::distributed::one")]
     pub nnodes: u32,
+    /// Image-text / streaming / resume options. Flattened: top-level keys on
+    /// the wire, all omitted for a causal-LM job.
+    #[serde(flatten)]
+    pub opts: ImageTextOpts,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,6 +115,17 @@ pub enum StatusLine {
         loss: Option<f32>,
         #[serde(default)]
         lr: Option<f32>,
+        /// Pre-clip gradient norm (image_text path only).
+        #[serde(default)]
+        grad_norm: Option<f32>,
+        #[serde(default)]
+        tokens_per_second: Option<f32>,
+    },
+    /// Training continued from a checkpoint (image_text path only).
+    Resumed {
+        step: u64,
+        #[serde(default)]
+        path: Option<PathBuf>,
     },
     Saved {
         path: PathBuf,
@@ -175,12 +191,21 @@ impl HfTrainerRunner {
     ) -> Result<HfRunArtifact, RunError> {
         // Ensure venv (blocking — fine, this only fires on the
         // first hf_* recipe of a session).
-        let python = tokio::task::spawn_blocking(ensure_venv)
-            .await
-            .map_err(|e| RunError::Io {
-                path: PathBuf::from("ensure_venv-join"),
-                source: std::io::Error::other(format!("{e}")),
-            })??;
+        // image_text jobs run in their own transformers-5 profile; every
+        // other job keeps the original venv.
+        let image_text = job.opts.is_image_text();
+        let python = tokio::task::spawn_blocking(move || {
+            if image_text {
+                ensure_venv_profile(&IMAGE_TEXT_PROFILE)
+            } else {
+                ensure_venv()
+            }
+        })
+        .await
+        .map_err(|e| RunError::Io {
+            path: PathBuf::from("ensure_venv-join"),
+            source: std::io::Error::other(format!("{e}")),
+        })??;
 
         // Write job spec to a tempfile so the wrapper can read it
         // without argv-size constraints.
@@ -420,11 +445,91 @@ mod tests {
             dpo: None,
             nproc_per_node: 1,
             nnodes: 1,
+            opts: ImageTextOpts::default(),
         };
         let s = serde_json::to_string(&job).unwrap();
         let back: HfTrainerJob = serde_json::from_str(&s).unwrap();
         assert_eq!(back.task, "sft");
         assert_eq!(back.peft.as_ref().unwrap().method, "qlora");
+    }
+
+    /// A causal-LM job's wire spec must not grow any key: the Python wrapper
+    /// for existing recipes sees exactly what it saw before.
+    #[test]
+    fn causal_lm_job_wire_has_no_new_keys() {
+        let job: HfTrainerJob = serde_json::from_value(serde_json::json!({
+            "task": "sft", "base_model": "m", "train_dataset_path": "/t",
+            "eval_dataset_path": null, "output_dir": "/o", "lr": 0.1, "epochs": 1,
+            "batch_size": 1, "grad_accum": 1, "seq_len": 8, "seed": 1
+        }))
+        .unwrap();
+        let v = serde_json::to_value(&job).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "base_model",
+                "batch_size",
+                "dpo",
+                "epochs",
+                "eval_dataset_path",
+                "extra",
+                "grad_accum",
+                "lr",
+                "nnodes",
+                "nproc_per_node",
+                "output_dir",
+                "peft",
+                "seed",
+                "seq_len",
+                "task",
+                "train_dataset_path"
+            ]
+        );
+    }
+
+    #[test]
+    fn image_text_job_flattens_options_onto_the_wire() {
+        let job: HfTrainerJob = serde_json::from_value(serde_json::json!({
+            "task": "sft", "base_model": "m", "train_dataset_path": "/t",
+            "eval_dataset_path": null, "output_dir": "/o", "lr": 0.1, "epochs": 1,
+            "batch_size": 8, "grad_accum": 4, "seq_len": 512, "seed": 1,
+            "arch": "image_text", "resume": true, "dataset_shards": ["/s0", "/s1"]
+        }))
+        .unwrap();
+        assert!(job.opts.is_image_text() && job.opts.resume);
+        let v = serde_json::to_value(&job).unwrap();
+        assert_eq!(v["arch"], "image_text");
+        assert_eq!(v["dataset_shards"][1], "/s1");
+    }
+
+    #[test]
+    fn step_line_accepts_new_and_old_shapes() {
+        let old: StatusLine =
+            serde_json::from_str(r#"{"kind":"step","step":1,"total":2,"loss":0.5,"lr":1e-4}"#)
+                .unwrap();
+        assert!(matches!(
+            old,
+            StatusLine::Step {
+                grad_norm: None,
+                ..
+            }
+        ));
+        let new: StatusLine = serde_json::from_str(
+            r#"{"kind":"step","step":1,"total":2,"loss":0.5,"lr":1e-4,"grad_norm":0.7,"tokens_per_second":1234.5}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            new,
+            StatusLine::Step {
+                grad_norm: Some(_),
+                ..
+            }
+        ));
+        let r: StatusLine =
+            serde_json::from_str(r#"{"kind":"resumed","step":500,"path":"/c/step-500"}"#).unwrap();
+        assert!(matches!(r, StatusLine::Resumed { step: 500, .. }));
     }
 
     #[test]
@@ -450,5 +555,106 @@ mod tests {
         // Until then it asserts the path-search code doesn't panic
         // even when none exists.
         let _ = wrapper_path();
+    }
+
+    /// End to end through the runner with a stub wrapper and a fake venv:
+    /// an image_text job picks the image-text profile's interpreter (the
+    /// original venv is pointed at a path that does not exist, so a wrong
+    /// pick fails), and the new `resumed` and extended `step` lines parse.
+    #[cfg(unix)]
+    #[test]
+    fn image_text_job_uses_its_own_venv_and_new_events_flow() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock poisoned");
+        let td = tempfile::tempdir().unwrap();
+        let venv = td.path().join("it-venv");
+        std::fs::create_dir_all(venv.join("bin")).unwrap();
+        // A "python" that records its argv[0..] then runs the real one.
+        let py = venv.join("bin/python");
+        std::fs::write(
+            &py,
+            "#!/bin/sh\ntouch \"$(dirname \"$0\")/used\"\nexec python3 \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            venv.join(".blut_hf_venv_version"),
+            super::super::venv::IMAGE_TEXT_VENV_VERSION,
+        )
+        .unwrap();
+        let wrapper = td.path().join("stub.py");
+        std::fs::write(
+            &wrapper,
+            r#"
+import json, sys
+spec = json.load(open(sys.argv[1]))
+assert spec["arch"] == "image_text" and spec["resume"] is True, spec
+for l in (
+    {"kind": "resumed", "step": 500, "path": "/c/step-500"},
+    {"kind": "step", "step": 501, "total": 900, "loss": 0.5, "lr": 1e-4,
+     "grad_norm": 0.9, "tokens_per_second": 1234.0},
+    {"kind": "saved", "path": "/c/step-1000"},
+    {"kind": "done", "checkpoint_dir": spec["output_dir"], "final_loss": 0.25, "steps": 900},
+):
+    print(json.dumps(l), flush=True)
+"#,
+        )
+        .unwrap();
+        let prev: Vec<_> = [
+            "BLUT_HF_VENV",
+            "BLUT_HF_VENV_IMAGE_TEXT",
+            "BLUT_HF_TRAINER_RUNNER",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
+        // SAFETY: serialized by TEST_ENV_LOCK.
+        unsafe {
+            std::env::set_var("BLUT_HF_VENV", td.path().join("no-such-venv"));
+            std::env::set_var("BLUT_HF_VENV_IMAGE_TEXT", &venv);
+            std::env::set_var("BLUT_HF_TRAINER_RUNNER", &wrapper);
+        }
+        let job: HfTrainerJob = serde_json::from_value(serde_json::json!({
+            "task": "sft", "base_model": "m", "train_dataset_path": "/t",
+            "eval_dataset_path": null, "output_dir": td.path().join("out"), "lr": 0.1,
+            "epochs": 1, "batch_size": 1, "grad_accum": 1, "seq_len": 8, "seed": 1,
+            "arch": "image_text", "resume": true
+        }))
+        .unwrap();
+        let seen: Arc<Mutex<Vec<StatusLine>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let res = rt.block_on(async {
+            HfTrainerRunner::new()
+                .run(job, Box::new(move |s| sink.lock().push(s)))
+                .await
+        });
+        unsafe {
+            for (k, v) in prev {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        let art = res.expect("run");
+        assert!(
+            venv.join("bin/used").exists(),
+            "image-text interpreter not used"
+        );
+        assert_eq!(art.final_loss, Some(0.25));
+        let seen = seen.lock();
+        assert!(matches!(seen[0], StatusLine::Resumed { step: 500, .. }));
+        assert!(matches!(
+            seen[1],
+            StatusLine::Step {
+                grad_norm: Some(_),
+                tokens_per_second: Some(_),
+                ..
+            }
+        ));
     }
 }
