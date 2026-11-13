@@ -75,7 +75,7 @@ which = "6"
 rand = "0.8"
 # conversations.rs reads the lamu conversation DB; atomic JSONL writes
 # + several backend runners stage to a temp dir.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile = "3"
 
 [dev-dependencies]
