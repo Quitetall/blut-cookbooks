@@ -47,7 +47,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # The engine commit under test (Quitetall/blut).
-  BLUT_ENGINE_REV: 5df1aa3cdf1234bd5b62dc21c0885e69449fa59b
+  BLUT_ENGINE_REV: 44491b7ad87daf884c93987adb74865b59b7d26a
   PYTHONUTF8: "1"
   HF_HUB_DISABLE_TELEMETRY: "1"
 jobs:
