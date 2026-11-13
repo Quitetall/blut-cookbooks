@@ -37,6 +37,28 @@ def test_runctx_resolve(monkeypatch, tmp_path):
 
 
 # ---- status ----
+def test_relay_writes_one_marked_json_line(capsys):
+    line = status.relay("step", step=1, total=2, loss=0.5, lr=1e-3, vram_mb=0)
+    out = capsys.readouterr().out
+    assert out == line + "\n"
+    assert out.startswith("BLUT_STATUS ")
+    assert json.loads(out[len(status.RELAY_PREFIX):]) == {
+        "kind": "step", "step": 1, "total": 2, "loss": 0.5, "lr": 1e-3, "vram_mb": 0}
+
+
+def test_relay_drops_what_json_cannot_carry_and_never_raises(capsys):
+    # The engine's update has no NaN; a number standing in for one would be a lie.
+    assert status.relay("done", final_loss=float("nan"), checkpoint_dir="/x") is None
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "not sent" in captured.err
+
+
+def test_relay_refuses_a_kind_the_engine_does_not_know():
+    with pytest.raises(ValueError):
+        status.relay("epoch", loss=1.0)
+
+
 def test_status_emit_writes_jsonl_and_returns(tmp_path, capsys):
     rec = status.step(1, 100, loss=5.0, lr=1e-3, vram_mb=8000, job_dir=tmp_path)
     assert rec["kind"] == "step" and rec["loss"] == 5.0

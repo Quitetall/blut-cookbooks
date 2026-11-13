@@ -14,7 +14,8 @@
 //!
 //!   - `stages::*` — concrete generic-LLM ingredient impls (materialize,
 //!     filter, split, sft/dpo/distill train, merge_lora, convert_gguf,
-//!     register_model, eval_*).
+//!     register_model, eval_*, and `to_checks_jsonl` / `from_checks_jsonl`,
+//!     which put a dataset behind the engine's `check_jsonl` / `assert`).
 //!   - `backends::*` — the concrete training-backend identities
 //!     (`HfTrainerBackend`, `LamuTrainerBackend`) + their subprocess
 //!     runners / venv management / backend-specific ingredients. Re-exports
@@ -23,6 +24,8 @@
 //!     `StatusFn` (the runtime contract a concrete trainer implements).
 //!   - `convert` — HF checkpoint → GGUF conversion (llama.cpp tools).
 //!   - `conversations` — lamu conversation-DB → JSONL dump.
+//!   - `progress` — forwards a trainer's updates as its stage's progress,
+//!     the format `blut log` and `blut jobs` read.
 //!   - `StandardCookbook` — the `Cookbook` impl + `registry()` entry point.
 //!
 //! The engine primitives the ingredients wire (framework, artifacts, config,
@@ -41,6 +44,8 @@ pub mod conversations;
 pub mod convert;
 pub mod distributed;
 pub mod evaluator;
+pub mod local_stage;
+pub mod progress;
 pub mod stages;
 
 /// Process-wide lock for tests that mutate environment variables.
@@ -114,6 +119,13 @@ static STANDARD_STAGES_ERASED: &[(&str, blut::framework::stage::ErasedStageCtor)
     ("merge_reports", || {
         std::sync::Arc::new(stages::MergeReports)
     }),
+    // Carry a dataset across the engine's `check_jsonl` / `assert` guards.
+    ("to_checks_jsonl", || {
+        std::sync::Arc::new(stages::ToChecksJsonl)
+    }),
+    ("from_checks_jsonl", || {
+        std::sync::Arc::new(stages::FromChecksJsonl)
+    }),
     // HF-backend-specific ingredients
     ("hf_sft_train", || {
         std::sync::Arc::new(backends::hf_trainer::stages::HfSftTrain)
@@ -124,6 +136,11 @@ static STANDARD_STAGES_ERASED: &[(&str, blut::framework::stage::ErasedStageCtor)
 ];
 
 impl Cookbook for StandardCookbook {
+    /// This build, folded into every stage cache key: crate name, version,
+    /// and the git commit and uncommitted changes `build.rs` stamps.
+    fn identity(&self) -> Option<blut::framework::code_identity::BuildIdentity> {
+        Some(blut::cookbook_identity!())
+    }
     fn name(&self) -> &'static str {
         "standard"
     }

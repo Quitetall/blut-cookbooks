@@ -7,6 +7,12 @@ block-buffered stdout so journald + the live monitor see events as they happen
 run sees only the launch line today). The same line is appended to
 ``<job_dir>/status.jsonl`` for post-hoc reads. Mirror ``protocol.rs`` exactly.
 
+``relay`` is the channel for a process a BLUT stage launched and reads (the
+generic trainer under ``train_model``): one ``BLUT_STATUS <json>`` line on
+stdout, which the stage forwards to the engine as its own progress and keeps
+off the terminal. It writes no file; the engine records what the stage
+forwards.
+
 stdlib-only. Emitting must never crash a run (the status.jsonl append is guarded).
 """
 from __future__ import annotations
@@ -18,10 +24,39 @@ from typing import Any, Dict, List, Optional
 
 from . import runctx
 
-__all__ = ["emit", "step", "eval_pass", "saved", "done", "failed", "read", "VALID_KINDS"]
+__all__ = ["emit", "step", "eval_pass", "saved", "done", "failed", "read", "relay",
+           "VALID_KINDS", "RELAY_KINDS", "RELAY_PREFIX"]
 
 VALID_KINDS = ("step", "eval", "saved", "done", "failed")
 TERMINAL_KINDS = ("done", "failed")
+
+#: Marks a stdout line the launching stage forwards to the engine
+#: (``blut_backends::progress::STATUS_PREFIX`` on the Rust side).
+RELAY_PREFIX = "BLUT_STATUS "
+#: ``protocol.rs``'s kinds, its liveness ``heartbeat`` included.
+RELAY_KINDS = VALID_KINDS + ("heartbeat",)
+
+
+def relay(kind: str, **fields: Any) -> Optional[str]:
+    """Write one StatusUpdate for the launching stage to forward: a flushed
+    ``BLUT_STATUS <json>`` line on stdout. Returns the line, or ``None`` when
+    nothing was written: JSON has no NaN or infinity, and the engine's update
+    has no way to carry one, so such a record is dropped (with a note on
+    stderr) rather than sent as a number it is not. A bad ``kind`` is a
+    caller bug and raises."""
+    if kind not in RELAY_KINDS:
+        raise ValueError(f"unknown StatusUpdate kind {kind!r}; one of {list(RELAY_KINDS)}")
+    try:
+        line = RELAY_PREFIX + json.dumps({"kind": kind, **fields}, allow_nan=False)
+    except (TypeError, ValueError) as e:
+        sys.stderr.write(f"[status] {kind} update not sent ({e}): {fields}\n")
+        return None
+    try:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+    except OSError:
+        return None  # stdout closed: there is no stage left to read it
+    return line
 
 
 def emit(kind: str, *, job_dir: Optional[Path] = None, to_stdout: bool = True,

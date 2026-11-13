@@ -61,3 +61,52 @@ def test_a_multi_node_job_saves_on_every_node(runner):
     assert runner._distributed_defaults({"nnodes": 2}) == {"save_on_each_node": True}
     assert runner._distributed_defaults({"nnodes": 1}) == {}
     assert runner._distributed_defaults({}) == {}
+
+
+def test_vram_is_zero_off_the_gpu_and_measured_on_it(runner, monkeypatch):
+    # The Rust side relays each step as the engine's trainer update, whose
+    # vram field `blut log` prints; it must be a measurement, never a guess.
+    import sys
+    import types
+
+    monkeypatch.delitem(sys.modules, "torch", raising=False)
+    assert runner._vram_mb() == 0
+
+    cuda = types.SimpleNamespace(is_available=lambda: True,
+                                 memory_allocated=lambda: 3 * 1024 * 1024)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(cuda=cuda))
+    assert runner._vram_mb() == 3
+
+    cuda.is_available = lambda: False
+    assert runner._vram_mb() == 0
+
+
+@pytest.mark.parametrize("metric", ["loss", "eval_loss"])
+@pytest.mark.parametrize("value, token", [
+    (float("nan"), "nan"), (float("inf"), "inf"), (float("-inf"), "-inf")])
+def test_a_non_finite_loss_is_a_diverged_line(runner, metric, value, token):
+    lines = runner._LogLines()
+    lines.total = 10
+    out = lines.lines({metric: value, "learning_rate": 1e-4}, 5)
+    assert out == [{"kind": "diverged", "step": 5, "total": 10,
+                    "metric": metric, "value": token}]
+    json.dumps(out, allow_nan=False)  # valid JSON, unlike a bare NaN
+    assert lines.last_loss is None
+
+
+def test_a_log_event_becomes_its_status_lines(runner, monkeypatch):
+    # HF logs training, evaluation and the end-of-run summary through one
+    # callback. An evaluation is the engine's `eval` update; the others are
+    # steps, with the latest training loss and, from a training log, the
+    # learning rate. Nothing HF did not log is filled in.
+    monkeypatch.setattr(runner, "_vram_mb", lambda: 7)
+    lines = runner._LogLines()
+    lines.total = 10
+    assert lines.lines({"eval_loss": 1.5, "eval_runtime": 0.2}, 0) == [
+        {"kind": "eval", "step": 0, "eval_loss": 1.5}]
+    assert lines.lines({"loss": 2.0, "learning_rate": 1e-4, "epoch": 0.5}, 5) == [
+        {"kind": "step", "step": 5, "total": 10, "loss": 2.0, "lr": 1e-4, "vram_mb": 7}]
+    assert lines.lines({"eval_loss": 1.25}, 5) == [
+        {"kind": "eval", "step": 5, "eval_loss": 1.25}]
+    assert lines.lines({"train_runtime": 3.0, "train_loss": 1.9}, 10) == [
+        {"kind": "step", "step": 10, "total": 10, "loss": 2.0, "lr": None, "vram_mb": 7}]

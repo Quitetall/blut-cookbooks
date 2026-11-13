@@ -45,7 +45,10 @@ def _build_cosine(cfg: CosineConfig, optimizer):
                 p = self.epoch / max(self.warmup_epochs, 1)
                 lr = self.warmup_start_lr + (self._peak_lr - self.warmup_start_lr) * p
             else:
-                progress = (self.epoch - self.warmup_epochs) / max(self.total_epochs - self.warmup_epochs, 1)
+                # The trainer sets each epoch's LR before training it, so the
+                # first post-warmup epoch is progress 0 and the last epoch
+                # still trains above min_lr (which may be 0).
+                progress = (self.epoch - self.warmup_epochs - 1) / max(self.total_epochs - self.warmup_epochs, 1)
                 progress = min(progress, 1.0)
                 lr = self.min_lr + 0.5 * (self._peak_lr - self.min_lr) * (1 + math.cos(math.pi * progress))
             for pg in self.optimizer.param_groups:
@@ -100,7 +103,10 @@ def _build_linear(cfg: LinearConfig, optimizer):
                 p = self.epoch / max(self.warmup_epochs, 1)
                 lr = self.warmup_start_lr + (self._peak_lr - self.warmup_start_lr) * p
             else:
-                progress = (self.epoch - self.warmup_epochs) / max(self.total_epochs - self.warmup_epochs, 1)
+                # The trainer sets each epoch's LR before training it, so the
+                # first post-warmup epoch is progress 0 and the last epoch
+                # still trains above min_lr (which may be 0).
+                progress = (self.epoch - self.warmup_epochs - 1) / max(self.total_epochs - self.warmup_epochs, 1)
                 progress = min(progress, 1.0)
                 lr = self._peak_lr + (self.min_lr - self._peak_lr) * progress
             for pg in self.optimizer.param_groups:

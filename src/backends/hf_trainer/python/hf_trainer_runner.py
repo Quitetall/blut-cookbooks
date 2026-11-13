@@ -12,7 +12,9 @@ The job JSON conforms to the `HfTrainerJob` struct in
 status event on stdout. Stderr is free-form.
 
 Wire schema (matches `runner::StatusLine`):
-  {"kind":"step","step":int,"total":int,"loss":float,"lr":float}
+  {"kind":"step","step":int,"total":int,"loss":float,"lr":float,"vram_mb":int}
+  {"kind":"eval","step":int,"eval_loss":float}
+  {"kind":"diverged","step":int,"total":int,"metric":str,"value":"nan"|"inf"|"-inf"}
   {"kind":"saved","path":str}
   {"kind":"done","checkpoint_dir":str,"final_loss":float}
   {"kind":"failed","error":str}
@@ -25,11 +27,12 @@ listed in `runner::REQUIRED_PKGS`. New dep = bump
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 def _is_local_leader() -> bool:
@@ -43,6 +46,58 @@ def _is_local_leader() -> bool:
     fail its stage.
     """
     return os.environ.get("LOCAL_RANK", "0") == "0"
+
+
+def _vram_mb() -> int:
+    """GPU memory this process holds, in MiB; 0 when it is not on a GPU.
+
+    The measure the lamu trainer reports (`torch.cuda.memory_allocated`). Reads
+    torch only if training already imported it, so loading this module never
+    pulls in the training stack.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_available():
+        return 0
+    return int(torch.cuda.memory_allocated() / (1024 * 1024))
+
+
+class _LogLines:
+    """The status lines one HF log event reports. Kept free of transformers so
+    the mapping is testable without a training stack."""
+
+    def __init__(self) -> None:
+        self.last_loss: Optional[float] = None
+        self.total: int = 0
+
+    def lines(self, logs: Optional[Dict[str, Any]], step: int) -> List[Dict[str, Any]]:
+        """An evaluation log (one with ``eval_loss``) is an ``eval`` line. Any
+        other log is a ``step`` line carrying the latest training loss and,
+        from a training log, the learning rate; a log that has neither (the
+        end-of-run summary) leaves them null."""
+        logs = logs or {}
+        for metric in ("loss", "eval_loss"):
+            if metric in logs and not math.isfinite(float(logs[metric])):
+                # JSON has no NaN. A line naming it reaches the engine's
+                # divergence check; `json.dumps` would write a bare NaN, which
+                # the runner cannot parse and drops.
+                return [{"kind": "diverged", "step": step, "total": self.total,
+                         "metric": metric, "value": str(float(logs[metric]))}]
+        out: List[Dict[str, Any]] = []
+        if "eval_loss" in logs:
+            out.append({"kind": "eval", "step": step, "eval_loss": float(logs["eval_loss"])})
+            if "loss" not in logs:
+                return out
+        if "loss" in logs:
+            self.last_loss = float(logs["loss"])
+        out.append({
+            "kind": "step",
+            "step": step,
+            "total": self.total,
+            "loss": self.last_loss,
+            "lr": float(logs["learning_rate"]) if "learning_rate" in logs else None,
+            "vram_mb": _vram_mb(),
+        })
+        return out
 
 
 def emit(line: Dict[str, Any]) -> None:
@@ -198,25 +253,14 @@ def run_sft(spec: Dict[str, Any]) -> None:
 
     class Emitter(TrainerCallback):
         def __init__(self) -> None:
-            self.last_loss: Optional[float] = None
-            self.total: int = 0
+            self.log_lines = _LogLines()
 
         def on_train_begin(self, args, state, control, **kwargs):
-            self.total = int(state.max_steps or 0)
+            self.log_lines.total = int(state.max_steps or 0)
 
         def on_log(self, args, state, control, logs=None, **kwargs):
-            logs = logs or {}
-            if "loss" in logs:
-                self.last_loss = float(logs["loss"])
-            emit(
-                {
-                    "kind": "step",
-                    "step": int(state.global_step or 0),
-                    "total": self.total,
-                    "loss": self.last_loss,
-                    "lr": float(logs.get("learning_rate", 0.0)) if "learning_rate" in logs else None,
-                }
-            )
+            for line in self.log_lines.lines(logs, int(state.global_step or 0)):
+                emit(line)
 
         def on_save(self, args, state, control, **kwargs):
             emit(
@@ -289,31 +333,18 @@ def run_dpo(spec: Dict[str, Any]) -> None:
         **_distributed_defaults(spec),
     )
 
-    # DPO progress fan-out — same Step/Saved schema as SFT so the
+    # DPO progress fan-out — same Step/Eval/Saved schema as SFT so the
     # Rust runner can consume both paths identically.
     class DpoEmitter(TrainerCallback):
         def __init__(self) -> None:
-            self.last_loss: Optional[float] = None
-            self.total: int = 0
+            self.log_lines = _LogLines()
 
         def on_train_begin(self, args, state, control, **kwargs):
-            self.total = int(state.max_steps or 0)
+            self.log_lines.total = int(state.max_steps or 0)
 
         def on_log(self, args, state, control, logs=None, **kwargs):
-            logs = logs or {}
-            if "loss" in logs:
-                self.last_loss = float(logs["loss"])
-            emit(
-                {
-                    "kind": "step",
-                    "step": int(state.global_step or 0),
-                    "total": self.total,
-                    "loss": self.last_loss,
-                    "lr": float(logs.get("learning_rate", 0.0))
-                    if "learning_rate" in logs
-                    else None,
-                }
-            )
+            for line in self.log_lines.lines(logs, int(state.global_step or 0)):
+                emit(line)
 
         def on_save(self, args, state, control, **kwargs):
             emit(

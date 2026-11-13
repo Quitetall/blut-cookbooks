@@ -1,0 +1,11 @@
+{
+  "name": "guarded_dataset",
+  "nodes": [
+    { "stage": "load_dataset", "args": { "path": "data/train.jsonl" } },
+    { "stage": "to_checks_jsonl" },
+    { "stage": "check_jsonl", "args": { "min_rows": 1000, "max_rows": 1000000 } },
+    { "stage": "from_checks_jsonl" },
+    { "stage": "split_train_eval", "args": { "eval_ratio": 0.1, "seed": 42 } }
+  ],
+  "edges": [[0, 1], [1, 2], [2, 3], [3, 4]]
+}

@@ -140,15 +140,23 @@ def _rotate(path: Path, keep_last_n: int) -> None:
                 pass
 
 
-def load(path, *, validate: bool = True, map_location: Any = "cpu") -> Dict[str, Any]:
+def load(path, *, validate: bool = True, map_location: Any = "cpu",
+         require_sidecar: bool = False) -> Dict[str, Any]:
     """Load a checkpoint, verifying integrity first. Raises ``CheckpointError``
-    on a missing/corrupt file rather than returning silent garbage."""
+    on a missing/corrupt file rather than returning silent garbage.
+
+    ``require_sidecar`` refuses a checkpoint whose ``.sha256`` sidecar is
+    missing instead of loading it unverified. A resume that can fall back to an
+    older checkpoint should set it: the sidecar is written after the rename, so
+    a crash between the two leaves a file nothing has verified."""
     import torch  # lazy
     path = Path(path)
     if not path.exists():
         raise CheckpointError(f"no checkpoint: {path}")
     if validate:
         sidecar = path.with_suffix(path.suffix + ".sha256")
+        if not sidecar.exists() and require_sidecar:
+            raise CheckpointError(f"no .sha256 sidecar for {path}; integrity unverified")
         if sidecar.exists():
             want = sidecar.read_text().strip()
             got = _sha256(path)

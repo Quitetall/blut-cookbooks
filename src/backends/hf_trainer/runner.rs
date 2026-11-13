@@ -8,11 +8,19 @@
 //!     than argv) so the spec can carry long fields (prompts,
 //!     paths, hyperparams) without bumping ARG_MAX.
 //!   - Stdout: one JSON line per status event. Schema:
-//!     `{"kind": "step", "step": int, "total": int, "loss": f}`
+//!     `{"kind": "step", "step": int, "total": int, "loss": f, "lr": f, "vram_mb": int}`
+//!     `{"kind": "eval", "step": int, "eval_loss": f}`
+//!     `{"kind": "diverged", "step": int, "total": int, "metric": str, "value": str}`
 //!     `{"kind": "saved", "path": str}`
 //!     `{"kind": "done", "checkpoint_dir": str, "final_loss": f}`
 //!     `{"kind": "failed", "error": str}`
+//!     `loss`, `lr` and `final_loss` may be null: HF logs them only on some
+//!     steps, and a run that trained no step has no training loss.
 //!   - Stderr: free-form. Captured to tracing::warn.
+//!
+//! The stages relay these lines to the executor in the engine's trainer
+//! format, [`StatusLine::status_update`], which is what `blut log` and
+//! `blut jobs` read.
 //!
 //! The wrapper script lives at
 //! `src/backends/hf_trainer/python/hf_trainer_runner.py` and is
@@ -27,8 +35,8 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 
+use blut::protocol::StatusUpdate;
 use blut::python_kill::graceful_kill_pid;
 
 use super::venv::{VenvError, ensure_venv};
@@ -78,6 +86,15 @@ pub struct HfTrainerJob {
     /// the wrapper then also saves a checkpoint on each node.
     #[serde(default = "crate::distributed::one")]
     pub nnodes: u32,
+    /// Where the run is placed (`--launcher`). Not part of the spec the
+    /// wrapper reads: it decides how the wrapper is started, not what it does.
+    #[serde(skip)]
+    pub launch_target: blut::config::launcher::LaunchTarget,
+    /// The Slurm job name under `--launcher slurm`
+    /// (`StageContext::slurm_job_name()`). `None` keeps the generic
+    /// `blut-train`, which `blut cancel` cannot find.
+    #[serde(skip)]
+    pub slurm_job_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,16 +117,35 @@ pub struct DpoConfig {
 }
 
 /// One line emitted by the wrapper on stdout.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StatusLine {
     Step {
         step: u64,
         total: u64,
+        /// The latest logged training loss; `None` until HF has logged one.
         #[serde(default)]
         loss: Option<f32>,
+        /// `None` on a log that is not a training log (the end-of-run
+        /// summary; an evaluation is an `eval` line).
         #[serde(default)]
         lr: Option<f32>,
+        /// GPU memory the reporting process holds, in MiB (0 off the GPU).
+        #[serde(default)]
+        vram_mb: Option<u32>,
+    },
+    /// An evaluation pass HF logged, with its loss.
+    Eval {
+        step: u64,
+        eval_loss: f32,
+    },
+    /// A logged loss was not finite. `value` is `nan`, `inf` or `-inf`: JSON
+    /// has no such number.
+    Diverged {
+        step: u64,
+        total: u64,
+        metric: String,
+        value: String,
     },
     Saved {
         path: PathBuf,
@@ -122,6 +158,74 @@ pub enum StatusLine {
     Failed {
         error: String,
     },
+}
+
+impl StatusLine {
+    /// This line as the engine's trainer update, the format `blut log` and
+    /// `blut jobs` read from a stage's forwarded progress
+    /// (`StageEvent::StageStep { update }`), and the one the lamu trainer
+    /// emits natively.
+    ///
+    /// A step whose loss or learning rate HF has not logged becomes a
+    /// heartbeat naming the step, since the engine's step update has no way to
+    /// say "not measured" and a made-up number would read as a measurement. A
+    /// run that trained no step has no final loss, so its `done` has no
+    /// counterpart (`None`); the stage's own result still records the
+    /// checkpoint.
+    pub fn status_update(&self) -> Option<StatusUpdate> {
+        let count = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+        Some(match self {
+            StatusLine::Step {
+                step,
+                total,
+                loss: Some(loss),
+                lr: Some(lr),
+                vram_mb,
+            } => StatusUpdate::Step {
+                step: count(*step),
+                total: count(*total),
+                loss: *loss,
+                lr: *lr,
+                vram_mb: vram_mb.unwrap_or(0),
+            },
+            StatusLine::Step {
+                step,
+                total,
+                vram_mb,
+                ..
+            } => StatusUpdate::Heartbeat {
+                phase: Some(format!("step {step}/{total}")),
+                vram_mb: *vram_mb,
+            },
+            StatusLine::Eval { step, eval_loss } => StatusUpdate::Eval {
+                step: count(*step),
+                eval_loss: *eval_loss,
+            },
+            StatusLine::Diverged {
+                step,
+                total,
+                metric,
+                value,
+            } => StatusUpdate::Heartbeat {
+                phase: Some(format!("step {step}/{total} {metric}={value}")),
+                vram_mb: None,
+            },
+            StatusLine::Saved { path } => StatusUpdate::Saved { path: path.clone() },
+            StatusLine::Done {
+                checkpoint_dir,
+                final_loss: Some(final_loss),
+            } => StatusUpdate::Done {
+                final_loss: *final_loss,
+                checkpoint_dir: checkpoint_dir.clone(),
+            },
+            StatusLine::Done {
+                final_loss: None, ..
+            } => return None,
+            StatusLine::Failed { error } => StatusUpdate::Failed {
+                error: error.clone(),
+            },
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -214,29 +318,42 @@ impl HfTrainerRunner {
         // one node or several. This gated on `nproc_per_node > 1` alone and
         // always passed `--standalone`, so a multi-node HF job could not be
         // expressed at all.
-        let prefix = crate::distributed::launch_prefix(job.nproc_per_node, job.nnodes)
-            .map_err(RunError::Launch)?;
-        let mut cmd = Command::new(&python);
-        cmd.args(&prefix);
-        cmd.arg(&wrapper).arg(&spec_path);
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // KILL-1: new session/process group — see python_kill::pre_exec_setsid.
-        #[cfg(unix)]
-        {
-            // tokio's Command exposes `pre_exec` inherently.
-            // SAFETY: setsid is async-signal-safe and allocates nothing.
-            #[allow(unsafe_code)]
-            unsafe {
-                cmd.pre_exec(blut::python_kill::pre_exec_setsid);
-            }
-        }
-
-        let mut child = cmd.spawn().map_err(|source| RunError::Spawn {
+        let inner = [
+            wrapper.display().to_string(),
+            spec_path.display().to_string(),
+        ];
+        let (program, argv) = crate::distributed::training_argv_named(
+            job.launch_target,
+            &python.display().to_string(),
+            job.nproc_per_node,
+            job.nnodes,
+            true,
+            &inner,
+            job.slurm_job_name.as_deref().unwrap_or("blut-train"),
+        )
+        .map_err(RunError::Launch)?;
+        let mut cmdline = vec![program];
+        cmdline.extend(argv);
+        // A local run is contained (memory cap, peak, tree kill; the tree
+        // also dies if this future is dropped), and on Unix the child leads
+        // its own process group (KILL-1); see crate::local_stage.
+        let mut child = crate::local_stage::spawn(
+            job.launch_target,
+            "blut-hf_trainer",
+            &cmdline,
+            None,
+            &[],
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+            },
+        )
+        .await
+        .map_err(|e| RunError::Spawn {
             python: python.display().to_string(),
-            source,
+            source: crate::local_stage::spawn_error_to_io(e),
         })?;
         if let Some(pid) = child.id() {
             *self.child_pid.lock() = Some(pid);
@@ -245,8 +362,7 @@ impl HfTrainerRunner {
         }
 
         let started = Instant::now();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
+        let stdout = child.child_mut().stdout.take();
         let on_status: Arc<dyn Fn(StatusLine) + Send + Sync> = Arc::from(on_status);
         let collected: Arc<Mutex<(Option<HfRunArtifact>, Option<String>)>> =
             Arc::new(Mutex::new((None, None)));
@@ -293,28 +409,19 @@ impl HfTrainerRunner {
             None
         };
 
-        let stderr_handle = stderr.map(|stderr| {
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::warn!(target: "blut::hf_trainer_stderr", "{}", line);
-                }
-            })
+        // The pump also records the systemd backend's `Memory peak:` line.
+        child.pump_stderr(|line| {
+            tracing::warn!(target: "blut::hf_trainer_stderr", "{}", line);
         });
 
-        let exit = child.wait().await.map_err(|source| RunError::Io {
+        let exit = child.wait().await.map_err(|e| RunError::Io {
             path: PathBuf::from("hf-trainer-wait"),
-            source,
+            source: std::io::Error::other(e.to_string()),
         })?;
         if let Some(h) = stdout_handle
             && let Err(e) = h.await
         {
             tracing::error!(target: "blut::hf_trainer", "stdout reader join failed: {e}");
-        }
-        if let Some(h) = stderr_handle
-            && let Err(e) = h.await
-        {
-            tracing::error!(target: "blut::hf_trainer", "stderr reader join failed: {e}");
         }
         if let Some(pid) = self.child_pid.lock().take() {
             blut::python_kill::unregister_child(pid);
@@ -420,6 +527,8 @@ mod tests {
             dpo: None,
             nproc_per_node: 1,
             nnodes: 1,
+            launch_target: Default::default(),
+            slurm_job_name: None,
         };
         let s = serde_json::to_string(&job).unwrap();
         let back: HfTrainerJob = serde_json::from_str(&s).unwrap();
@@ -440,6 +549,80 @@ mod tests {
             // Round-trip back.
             let _ = serde_json::to_string(&parsed).unwrap();
         }
+    }
+
+    fn update(line: &str) -> Option<StatusUpdate> {
+        serde_json::from_str::<StatusLine>(line)
+            .unwrap()
+            .status_update()
+    }
+
+    /// Each wrapper line maps to the engine's trainer update: the format
+    /// `blut log` and `blut jobs` read. A measured step is a step.
+    #[test]
+    fn a_logged_step_becomes_the_engines_step() {
+        assert_eq!(
+            update(r#"{"kind":"step","step":4,"total":10,"loss":0.5,"lr":0.0002,"vram_mb":812}"#),
+            Some(StatusUpdate::Step {
+                step: 4,
+                total: 10,
+                loss: 0.5,
+                lr: 0.0002,
+                vram_mb: 812,
+            })
+        );
+        assert_eq!(
+            update(r#"{"kind":"eval","step":4,"eval_loss":1.25}"#),
+            Some(StatusUpdate::Eval {
+                step: 4,
+                eval_loss: 1.25
+            })
+        );
+        assert_eq!(
+            update(r#"{"kind":"saved","path":"/c/checkpoint-4"}"#),
+            Some(StatusUpdate::Saved {
+                path: "/c/checkpoint-4".into()
+            })
+        );
+        assert_eq!(
+            update(r#"{"kind":"done","checkpoint_dir":"/c","final_loss":0.25}"#),
+            Some(StatusUpdate::Done {
+                final_loss: 0.25,
+                checkpoint_dir: "/c".into()
+            })
+        );
+        assert_eq!(
+            update(r#"{"kind":"failed","error":"CUDA out of memory"}"#),
+            Some(StatusUpdate::Failed {
+                error: "CUDA out of memory".into()
+            })
+        );
+    }
+
+    /// What HF did not measure is not invented: a step without a logged loss
+    /// or learning rate (the end-of-run summary) still
+    /// shows progress, as a heartbeat, and a run with no training loss has no
+    /// `done` update rather than a zero one.
+    #[test]
+    fn an_unmeasured_value_is_never_filled_in() {
+        assert_eq!(
+            update(r#"{"kind":"step","step":4,"total":10,"loss":0.5,"lr":null,"vram_mb":812}"#),
+            Some(StatusUpdate::Heartbeat {
+                phase: Some("step 4/10".into()),
+                vram_mb: Some(812),
+            })
+        );
+        assert_eq!(
+            update(r#"{"kind":"step","step":1,"total":10,"loss":null,"lr":0.0002}"#),
+            Some(StatusUpdate::Heartbeat {
+                phase: Some("step 1/10".into()),
+                vram_mb: None,
+            })
+        );
+        assert_eq!(
+            update(r#"{"kind":"done","checkpoint_dir":"/c","final_loss":null}"#),
+            None
+        );
     }
 
     #[test]

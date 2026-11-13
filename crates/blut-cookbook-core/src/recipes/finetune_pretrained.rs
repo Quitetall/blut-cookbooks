@@ -21,7 +21,7 @@ use blut_backends::stages::{
     split_train_eval::{Args as SplitArgs, SplitTrainEval},
 };
 
-use crate::recipes::shared::{DatasetSelect, TrainShape};
+use crate::recipes::shared::{CheckpointOptions, DatasetSelect, TrainShape};
 use crate::stages::IngredientCfg;
 use crate::stages::load_dataset::{Args as LoadArgs, LoadDataset};
 use crate::stages::train_model::{Args as TrainArgs, TrainModel};
@@ -80,6 +80,10 @@ pub struct Args {
     /// `max_seq_len`.
     #[serde(flatten)]
     pub shape: TrainShape,
+    /// `checkpoint_every_steps`, `checkpoint_every_secs`, `log_every_steps`,
+    /// `train_attempts`.
+    #[serde(flatten)]
+    pub checkpoints: CheckpointOptions,
 }
 
 fn default_split() -> String {
@@ -163,7 +167,12 @@ impl Recipe for FinetunePretrained {
                 TakeTrain,
                 blut_backends::stages::take_train::Args::default(),
             )
-            .then(TrainModel, train_args(&args))
+            .then(TrainModel, train_args(&args));
+        let plan = match args.checkpoints.train_retry()? {
+            Some(policy) => plan.with_retry(policy),
+            None => plan,
+        };
+        let plan = plan
             .then(MergeLora, MergeArgs::default())
             .then(
                 ConvertGguf,
@@ -215,6 +224,9 @@ fn train_args(args: &Args) -> TrainArgs {
         parallel_strategy: args.shape.parallel_strategy,
         text_field: args.shape.text_field.clone(),
         max_seq_len: args.shape.max_seq_len,
+        checkpoint_every_steps: args.checkpoints.checkpoint_every_steps,
+        checkpoint_every_secs: args.checkpoints.checkpoint_every_secs,
+        log_every_steps: args.checkpoints.log_every_steps,
     }
 }
 
@@ -260,6 +272,7 @@ mod tests {
             notes: String::new(),
             dataset: DatasetSelect::default(),
             shape: TrainShape::default(),
+            checkpoints: CheckpointOptions::default(),
         }
     }
 
