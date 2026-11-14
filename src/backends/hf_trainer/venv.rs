@@ -55,7 +55,7 @@ pub const CAUSAL_LM_PROFILE: VenvProfile = VenvProfile {
 };
 
 /// Bump when `IMAGE_TEXT_PKGS` changes.
-pub const IMAGE_TEXT_VENV_VERSION: &str = "1";
+pub const IMAGE_TEXT_VENV_VERSION: &str = "2";
 
 /// Image-text (`AutoModelForImageTextToText`) fine-tuning. transformers 5.x is
 /// required for Idefics3/SmolVLM and Qwen3.5 loading in the form KnightLM's
@@ -71,6 +71,10 @@ pub const IMAGE_TEXT_PKGS: &[&str] = &[
     "accelerate>=1.0,<2",
     "safetensors>=0.4,<1",
     "torch>=2.4,<3",
+    // Image processors (SmolVLM/Idefics3) import torchvision. Its metadata pins
+    // the exact torch it was built against, so the resolver keeps the pair
+    // matched; the floor is the torchvision that pairs with torch 2.4.
+    "torchvision>=0.19,<1",
     "pillow>=10",
     "num2words",
 ];
@@ -411,6 +415,8 @@ mod tests {
         assert!(CAUSAL_LM_PROFILE.pkgs.contains(&"transformers>=4.45,<5"));
         assert!(IMAGE_TEXT_PROFILE.pkgs.contains(&"transformers==5.5.3"));
         assert!(!IMAGE_TEXT_PROFILE.pkgs.iter().any(|p| p.starts_with("trl")));
+        assert!(IMAGE_TEXT_PROFILE.pkgs.contains(&"torchvision>=0.19,<1"));
+        assert_eq!(IMAGE_TEXT_PROFILE.version, "2");
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //! invoked via the auto-managed venv at `~/.local/share/blut/hf-venv/`
 //! (see `super::venv`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -381,7 +381,11 @@ impl Default for HfTrainerRunner {
 ///   1. `$BLUT_HF_TRAINER_RUNNER` env (absolute path override)
 ///   2. `<exe_dir>/python/hf_trainer_runner.py` (when installed
 ///      alongside the binary)
-///   3. `<repo_root>/src/backends/hf_trainer/python/hf_trainer_runner.py`
+///   3. the source checkout this crate was compiled from
+///      (`CARGO_MANIFEST_DIR`, baked in at build time). This is what finds
+///      the script for a binary built from a git dependency, whose checkout
+///      lives under `~/.cargo/git/checkouts`.
+///   4. `<repo_root>/src/backends/hf_trainer/python/hf_trainer_runner.py`
 ///      (development tree)
 fn wrapper_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("BLUT_HF_TRAINER_RUNNER") {
@@ -394,6 +398,11 @@ fn wrapper_path() -> Option<PathBuf> {
         if p.exists() {
             return Some(p);
         }
+    }
+    let built_from = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/backends/hf_trainer/python/hf_trainer_runner.py");
+    if built_from.exists() {
+        return Some(built_from);
     }
     // Development tree fallback: walk up to find a Cargo.toml then
     // resolve against `src/backends/hf_trainer/python/`.
