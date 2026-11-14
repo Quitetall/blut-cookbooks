@@ -6,9 +6,13 @@ all-features = true
 
 [advisories]
 # Every entry needs a reason, and an unmaintained-only advisory is the only
-# kind that may be ignored. A vulnerability is fixed, not waived.
+# kind that may be ignored. A vulnerability is fixed, not waived, with one
+# recorded exception: RUSTSEC-2026-0459 below, a time-boxed waiver the owner
+# approved on 2026-11-13 because the fix needs a new engine release.
 ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode 1.3 is unmaintained but has no known vulnerability; it arrives through the blut engine, whose own deny.toml carries the same waiver until the engine migrates its cache and P2P wire codec" },
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained-only unsafe-libyaml is transitive through the blut engine's serde_yaml 0.9, which parses local operator-written config, never network input; no known vulnerability; the engine's own deny.toml carries the same waiver until it moves to a safe-Rust parser" },
+    { id = "RUSTSEC-2026-0459", reason = "VULNERABILITY, temporary owner-approved waiver (2026-11-13): libsqlite3-sys bundles a C SQLite with CVE-2026-119375; the patched libsqlite3-sys 0.39+ needs rusqlite 0.41, but the pinned blut engine (=0.2.0-alpha.1, and its main) uses rusqlite 0.32 and both link the native library, so this workspace cannot move alone; the cookbooks reach SQLite only through the engine's local registries; REMOVE this entry when the engine upgrades rusqlite; re-check by 2026-12-13" },
 ]
 
 [licenses]
