@@ -28,13 +28,91 @@ use blut::framework::stage::{Stage, StageContext};
 
 pub struct MergeLora;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Args {
     /// When false, attempt a real merge subprocess. When true, only
     /// relabel the method_tag (useful for tests + for already-merged
     /// checkpoints). Defaults to false (do the work).
     #[serde(default)]
     pub passthrough_only: bool,
+    /// "causal_lm" (default, existing behaviour: relabel only) or
+    /// "image_text": really fold the LoRA adapter into the base model with
+    /// `AutoModelForImageTextToText` (in the image-text venv), writing a
+    /// self-contained checkpoint. The relabel above leaves an adapter-only
+    /// directory that `convert_gguf` cannot read; image-text checkpoints are
+    /// new and have no caller relying on that.
+    #[serde(default = "default_arch", skip_serializing_if = "is_default_arch")]
+    pub arch: String,
+}
+
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            passthrough_only: false,
+            arch: default_arch(),
+        }
+    }
+}
+
+fn default_arch() -> String {
+    "causal_lm".into()
+}
+fn is_default_arch(a: &String) -> bool {
+    a == "causal_lm"
+}
+
+/// Run the image-text merge through the HF runner (`task = "merge"`).
+async fn merge_image_text(
+    ctx: &StageContext,
+    input: &HfCheckpoint,
+) -> Result<HfCheckpoint, StageError> {
+    use crate::backends::hf_trainer::{HfTrainerJob, HfTrainerRunner, ImageTextOpts, StatusLine};
+    let out = ctx.stage_dir.join("merged");
+    std::fs::create_dir_all(&out).map_err(|source| StageError::Io {
+        path: out.clone(),
+        source,
+    })?;
+    let job = HfTrainerJob {
+        task: "merge".into(),
+        base_model: input.base_model.clone(),
+        // Unused by a merge; the wire struct requires them.
+        train_dataset_path: input.path.clone(),
+        eval_dataset_path: None,
+        output_dir: out.clone(),
+        lr: 0.0,
+        epochs: 0,
+        batch_size: 0,
+        grad_accum: 0,
+        seq_len: 0,
+        seed: 0,
+        extra: serde_json::Map::new(),
+        peft: None,
+        dpo: None,
+        nproc_per_node: 1,
+        nnodes: 1,
+        opts: ImageTextOpts {
+            arch: "image_text".into(),
+            adapter_path: Some(input.path.clone()),
+            ..Default::default()
+        },
+    };
+    let mut runner = HfTrainerRunner::new();
+    let result = runner
+        .run(job, Box::new(|_: StatusLine| {}))
+        .await
+        .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
+    let content_hash = blut::framework::artifact::ContentHash::hash_dir(&result.checkpoint_dir)
+        .map_err(|source| StageError::Io {
+            path: result.checkpoint_dir.clone(),
+            source,
+        })?;
+    Ok(HfCheckpoint {
+        path: result.checkpoint_dir,
+        base_model: input.base_model.clone(),
+        method_tag: format!("{}_merged", input.method_tag),
+        content_hash,
+        final_loss: input.final_loss,
+    })
 }
 
 #[async_trait]
@@ -48,9 +126,9 @@ impl Stage for MergeLora {
 
     async fn run(
         &self,
-        _ctx: &StageContext,
+        ctx: &StageContext,
         input: HfCheckpoint,
-        _args: &Args,
+        args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
         // R23: input ckpt must carry a method_tag — the stage's
         // dispatch logic depends on it. Promoted from debug_assert
@@ -75,6 +153,9 @@ impl Stage for MergeLora {
             // tag to its `_merged` form so downstream stages can tell
             // a clean checkpoint from an unmerged one.
             "full" | "qlora_merged" | "lora_merged" => Ok(input),
+            "lora" if args.arch == "image_text" && !args.passthrough_only => {
+                merge_image_text(ctx, &input).await
+            }
             // Real merge would invoke trainer_sft.py --merge-only here;
             // for the framework-wiring commit we relabel the tag and
             // pass the same checkpoint through. The trainer in fact
@@ -140,5 +221,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.method_tag, "qlora_merged");
+    }
+
+    #[test]
+    fn default_args_serialize_unchanged() {
+        // Stage args feed the cache key.
+        let v = serde_json::to_value(Args::default()).unwrap();
+        assert_eq!(v, serde_json::json!({"passthrough_only": false}));
+        let a: Args = serde_json::from_str(r#"{"arch":"image_text"}"#).unwrap();
+        assert_eq!(a.arch, "image_text");
+    }
+
+    #[tokio::test]
+    async fn image_text_passthrough_only_still_just_relabels() {
+        let td = tempfile::tempdir().unwrap();
+        let args = Args {
+            passthrough_only: true,
+            arch: "image_text".into(),
+        };
+        let out = MergeLora
+            .run(&ctx(td.path()), ckpt("lora"), &args)
+            .await
+            .unwrap();
+        assert_eq!(out.method_tag, "lora_merged");
     }
 }
