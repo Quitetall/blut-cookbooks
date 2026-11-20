@@ -3,7 +3,8 @@
 //! Generic training stage that invokes the ingredient-based trainer
 //! (`blut_core.trainer`). Takes a `DatasetJsonl` input, writes an
 //! ingredient config JSON, shells out to the Python trainer, and
-//! returns an `HfCheckpoint`.
+//! returns an `HfCheckpoint`. The trainer's `BLUT_STATUS` stdout lines are
+//! forwarded to the engine as the stage's progress (`blut_backends::progress`).
 //!
 //! Nondeterministic (training is stochastic).
 
@@ -15,9 +16,11 @@ use blut::framework::artifact::ContentHash;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
+use blut::protocol::StatusUpdate;
 
 use super::shared::IngredientCfg;
-use blut_backends::distributed::{Rendezvous, torchrun_args};
+use blut::config::launcher::LaunchTarget;
+use blut_backends::distributed::training_argv_named;
 
 pub struct TrainModel;
 
@@ -71,6 +74,21 @@ pub struct Args {
     /// rejected at deserialize time, not at the Python boundary.
     #[serde(default)]
     pub parallel_strategy: ParallelStrategy,
+    /// Mid-stage checkpoint cadence in steps. When the engine gives the stage
+    /// a checkpoint slot, the trainer saves every this many steps; unset, it
+    /// saves every `checkpoint_every_secs` seconds instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_every_steps: Option<u32>,
+    /// Mid-stage checkpoint cadence in seconds when `checkpoint_every_steps` is
+    /// unset. The trainer uses 600 when both are unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_every_secs: Option<u32>,
+    /// Print and emit the training loss every this many steps (`[trainer]
+    /// step N/T loss=…`, a `BLUT_METRIC` `step` line, and a step update the
+    /// stage forwards to `blut log` and `blut jobs`). Unset: epoch lines
+    /// only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_every_steps: Option<u32>,
 }
 
 /// Multi-GPU parallel strategy. `Ddp` (default) replicates the model per rank;
@@ -83,6 +101,12 @@ pub enum ParallelStrategy {
     #[default]
     Ddp,
     Fsdp,
+}
+
+/// Whether a training run with these arguments uses a checkpoint slot.
+fn wants_checkpoint_slot(args: &Args) -> bool {
+    let distributed = args.nproc_per_node.max(1) * args.nnodes.max(1) > 1;
+    !(distributed && args.parallel_strategy == ParallelStrategy::Fsdp)
 }
 
 impl ParallelStrategy {
@@ -131,6 +155,13 @@ impl Stage for TrainModel {
         args.nproc_per_node.max(1)
     }
 
+    /// A mid-stage checkpoint slot, so an interrupted run resumes from its
+    /// last checkpoint. Not for distributed FSDP, whose sharded state the
+    /// trainer does not checkpoint mid-stage.
+    fn checkpoint_slot(&self, args: &Args) -> bool {
+        wants_checkpoint_slot(args)
+    }
+
     /// DDP: scale memory reservation by nproc.
     fn memory_gib_for(&self, args: &Args) -> u32 {
         4 * args.nproc_per_node.max(1)
@@ -142,123 +173,195 @@ impl Stage for TrainModel {
         input: DatasetJsonl,
         args: &Args,
     ) -> Result<HfCheckpoint, StageError> {
-        // Validate inputs
-        if args.epochs == 0 {
-            return Err(StageError::BadInput("epochs must be > 0".into()));
-        }
-        if args.batch_size == 0 {
-            return Err(StageError::BadInput("batch_size must be > 0".into()));
-        }
-        if args.lora_rank.is_some() {
-            return Err(StageError::BadInput(
-                "lora_rank is not read by the trainer; set the rank in the \
-                 lora_adapter model ingredient's config instead"
-                    .into(),
-            ));
-        }
-        if !input.path.exists() {
-            return Err(StageError::BadInput(format!(
-                "dataset not found: {}",
-                input.path.display()
-            )));
-        }
+        train(ctx, input, args, Self::NAME).await
+    }
+}
 
-        let output_dir = ctx.stage_dir.join("checkpoint");
-        std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {
-            path: output_dir.clone(),
+/// One training stage's run, its progress attributed to `stage_name`.
+async fn train(
+    ctx: &StageContext,
+    input: DatasetJsonl,
+    args: &Args,
+    stage_name: &'static str,
+) -> Result<HfCheckpoint, StageError> {
+    // Validate inputs
+    if args.epochs == 0 {
+        return Err(StageError::BadInput("epochs must be > 0".into()));
+    }
+    if args.batch_size == 0 {
+        return Err(StageError::BadInput("batch_size must be > 0".into()));
+    }
+    if args.lora_rank.is_some() {
+        return Err(StageError::BadInput(
+            "lora_rank is not read by the trainer; set the rank in the \
+             lora_adapter model ingredient's config instead"
+                .into(),
+        ));
+    }
+    if !input.path.exists() {
+        return Err(StageError::BadInput(format!(
+            "dataset not found: {}",
+            input.path.display()
+        )));
+    }
+
+    let output_dir = ctx.stage_dir.join("checkpoint");
+    std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {
+        path: output_dir.clone(),
+        source,
+    })?;
+
+    // Write ingredient config JSON
+    let config = serde_json::json!({
+        "dataset_path": input.path,
+        "output_dir": output_dir,
+        "model": args.model,
+        "optimizer": args.optimizer,
+        "scheduler": args.scheduler,
+        "loss": args.loss,
+        "step": args.step,
+        "epochs": args.epochs,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "device": args.device,
+        "lora_rank": args.lora_rank,
+        "parallel_strategy": args.parallel_strategy,
+        "text_field": args.text_field,
+        "max_seq_len": args.max_seq_len,
+        "checkpoint_every_steps": args.checkpoint_every_steps,
+        "checkpoint_every_secs": args.checkpoint_every_secs,
+        "log_every_steps": args.log_every_steps,
+    });
+    let config_path = ctx.stage_dir.join("train_config.json");
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).map_err(
+        |source| StageError::Io {
+            path: config_path.clone(),
             source,
-        })?;
+        },
+    )?;
 
-        // Write ingredient config JSON
-        let config = serde_json::json!({
-            "dataset_path": input.path,
-            "output_dir": output_dir,
-            "model": args.model,
-            "optimizer": args.optimizer,
-            "scheduler": args.scheduler,
-            "loss": args.loss,
-            "step": args.step,
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "seed": args.seed,
-            "device": args.device,
-            "lora_rank": args.lora_rank,
-            "parallel_strategy": args.parallel_strategy,
-            "text_field": args.text_field,
-            "max_seq_len": args.max_seq_len,
-        });
-        let config_path = ctx.stage_dir.join("train_config.json");
-        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).map_err(
-            |source| StageError::Io {
-                path: config_path.clone(),
-                source,
-            },
-        )?;
+    let TrainerLaunch { cmdline, env } = trainer_command(ctx, args, &config_path)?;
 
-        // Invoke the generic trainer (via torchrun when the run is distributed)
-        let nproc = args.nproc_per_node.max(1);
-        let nnodes = args.nnodes.max(1);
-        let rdzv = if nnodes > 1 {
-            Some(Rendezvous::from_env().map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?)
-        } else {
-            None
-        };
-        let mut cmd = std::process::Command::new("python3");
-        if let Some(launch) = torchrun_args(nproc, nnodes, rdzv.as_ref()) {
-            cmd.args(&launch);
-        }
-        cmd.args([
-            "-m",
-            "blut_core.trainer",
-            "--config",
-            config_path.to_str().unwrap(),
-        ]);
-        cmd.current_dir(&ctx.stage_dir);
-
-        // Pin only when this node runs a single process. With several local
-        // ranks torchrun assigns devices through LOCAL_RANK and a pin would
-        // collapse every rank onto one card. One rank per node (the usual
-        // multi-node shape) still pins: LOCAL_RANK is 0 there, so device 0
-        // must be the card the scheduler actually granted.
-        if nproc <= 1 {
-            if let Some(dev) = ctx.device_index {
-                cmd.env("CUDA_VISIBLE_DEVICES", dev.to_string());
+    // The trainer marks its progress `BLUT_STATUS <update>` on stdout; those
+    // lines go to the engine as this stage's progress (what `blut log` and
+    // `blut jobs` read), every other line to the terminal as before. The
+    // final loss it reports is the checkpoint's.
+    let forwarder = blut_backends::progress::Forwarder::new(ctx, stage_name);
+    let reported_loss = std::sync::Arc::new(std::sync::Mutex::new(None::<f32>));
+    let on_line = {
+        let reported_loss = reported_loss.clone();
+        move |line: &str| {
+            if let Some(StatusUpdate::Done { final_loss, .. }) = forwarder.relay_line(line) {
+                *reported_loss.lock().unwrap_or_else(|p| p.into_inner()) = Some(final_loss);
             }
         }
-
-        let status = cmd.status().map_err(|e| {
+    };
+    // Contained (memory cap, peak, tree kill on cancel or timeout); see local_stage.
+    let status = blut_backends::local_stage::run_reading_stdout(
+        ctx,
+        ctx.launch_target,
+        "blut-train_model",
+        &cmdline,
+        Some(&ctx.stage_dir),
+        &env,
+        on_line,
+    )
+    .await
+    .map_err(|e| match e {
+        StageError::Backend(e) => {
             StageError::Backend(anyhow::anyhow!("failed to run blut_core.trainer: {e}"))
-        })?;
-
-        if !status.success() {
-            return Err(StageError::Backend(anyhow::anyhow!(
-                "blut_core.trainer exited with {status}"
-            )));
         }
+        other => other,
+    })?;
 
-        // Verify output exists
-        if !output_dir.exists()
-            || output_dir
-                .read_dir()
-                .map_or(true, |mut d| d.next().is_none())
-        {
-            return Err(StageError::Backend(anyhow::anyhow!(
-                "trainer did not produce checkpoint in {}",
-                output_dir.display()
-            )));
-        }
-
-        let content_hash = ContentHash::hash_dir(&output_dir)
-            .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {e}")))?;
-
-        Ok(HfCheckpoint {
-            path: output_dir,
-            base_model: args.model.name.clone(),
-            method_tag: "full".into(),
-            content_hash,
-            final_loss: 0.0, // filled by trainer
-        })
+    if !status.success() {
+        return Err(StageError::Backend(anyhow::anyhow!(
+            "blut_core.trainer exited with {status}"
+        )));
     }
+
+    // Verify output exists
+    if !output_dir.exists()
+        || output_dir
+            .read_dir()
+            .map_or(true, |mut d| d.next().is_none())
+    {
+        return Err(StageError::Backend(anyhow::anyhow!(
+            "trainer did not produce checkpoint in {}",
+            output_dir.display()
+        )));
+    }
+
+    let content_hash = ContentHash::hash_dir(&output_dir)
+        .map_err(|e| StageError::Backend(anyhow::anyhow!("hash error: {e}")))?;
+
+    Ok(HfCheckpoint {
+        path: output_dir,
+        base_model: args.model.name.clone(),
+        method_tag: "full".into(),
+        content_hash,
+        final_loss: *reported_loss.lock().unwrap_or_else(|p| p.into_inner()),
+    })
+}
+
+/// The trainer process for one attempt, as a command line and its extra
+/// environment, so it can run contained (see `local_stage`).
+struct TrainerLaunch {
+    cmdline: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// The trainer process for one attempt: where `--launcher` placed it, with
+/// the device pin and the checkpoint slot's environment.
+fn trainer_command(
+    ctx: &StageContext,
+    args: &Args,
+    config_path: &std::path::Path,
+) -> Result<TrainerLaunch, StageError> {
+    // Invoke the generic trainer where `--launcher` placed it: locally
+    // (via torchrun when distributed) or as a Slurm step.
+    let nproc = args.nproc_per_node.max(1);
+    let nnodes = args.nnodes.max(1);
+    let inner = [
+        "-m",
+        "blut_core.trainer",
+        "--config",
+        config_path.to_str().unwrap(),
+    ]
+    .map(String::from);
+    let python = blut_backends::local_stage::python();
+    let (program, argv) = training_argv_named(
+        ctx.launch_target,
+        &python,
+        nproc,
+        nnodes,
+        args.device != "cpu",
+        &inner,
+        &ctx.slurm_job_name(),
+    )
+    .map_err(|e| StageError::Backend(anyhow::anyhow!(e)))?;
+    let mut cmdline = vec![program];
+    cmdline.extend(argv);
+
+    // Pin only when this node runs a single process. With several local
+    // ranks torchrun assigns devices through LOCAL_RANK and a pin would
+    // collapse every rank onto one card. One rank per node (the usual
+    // multi-node shape) still pins: LOCAL_RANK is 0 there, so device 0
+    // must be the card the scheduler actually granted.
+    // Under Slurm the allocation assigns devices, so only a local run pins.
+    let mut env = Vec::new();
+    if nproc <= 1
+        && ctx.launch_target == LaunchTarget::Local
+        && let Some(dev) = ctx.device_index
+    {
+        env.push(("CUDA_VISIBLE_DEVICES".to_string(), dev.to_string()));
+    }
+    // The checkpoint slot (engine CONTRACT.md §8): where to checkpoint and
+    // whether to resume. `srun` and `torchrun` hand it to every rank.
+    if let Some(slot) = &ctx.checkpoint {
+        env.extend(slot.env_vars().into_iter().map(|(k, v)| (k.to_string(), v)));
+    }
+    Ok(TrainerLaunch { cmdline, env })
 }
 
 /// `train_model` over the train half of a `DatasetSplit`.
@@ -284,6 +387,10 @@ impl Stage for TrainModelOnSplit {
         TrainModel.gpu_permits(args)
     }
 
+    fn checkpoint_slot(&self, args: &Args) -> bool {
+        wants_checkpoint_slot(args)
+    }
+
     fn memory_gib_for(&self, args: &Args) -> u32 {
         TrainModel.memory_gib_for(args)
     }
@@ -300,7 +407,7 @@ impl Stage for TrainModelOnSplit {
                 input.train.n_examples
             )));
         }
-        TrainModel.run(ctx, input.train, args).await
+        train(ctx, input.train, args, Self::NAME).await
     }
 }
 
@@ -336,6 +443,105 @@ mod tests {
         assert!(
             matches!(&r, Err(StageError::BadInput(m)) if m.contains("lora_adapter")),
             "got {r:?}"
+        );
+    }
+
+    fn minimal_args() -> Args {
+        serde_json::from_value(serde_json::json!({
+            "model": {"kind": "model", "name": "from_pretrained", "config": {}},
+            "optimizer": {"kind": "optimizer", "name": "adamw", "config": {}},
+            "scheduler": {"kind": "scheduler", "name": "constant", "config": {}},
+            "loss": {"kind": "loss", "name": "causal_lm", "config": {}},
+            "epochs": 1,
+        }))
+        .unwrap()
+    }
+
+    /// The cadence fields are new. Left unset they must not appear in the
+    /// serialized arguments, which are part of the stage's cache key: an
+    /// existing run keeps its identity.
+    #[test]
+    fn unset_checkpoint_fields_leave_the_arguments_unchanged() {
+        let v = serde_json::to_value(minimal_args()).unwrap();
+        for key in [
+            "checkpoint_every_steps",
+            "checkpoint_every_secs",
+            "log_every_steps",
+        ] {
+            assert!(v.get(key).is_none(), "{key} serialized while unset");
+        }
+    }
+
+    #[test]
+    fn training_opts_into_a_checkpoint_slot_except_distributed_fsdp() {
+        let mut a = minimal_args();
+        assert!(TrainModel.checkpoint_slot(&a));
+        assert!(TrainModelOnSplit.checkpoint_slot(&a));
+        a.nnodes = 2;
+        assert!(TrainModel.checkpoint_slot(&a), "multi-node DDP checkpoints");
+        a.parallel_strategy = ParallelStrategy::Fsdp;
+        assert!(!TrainModel.checkpoint_slot(&a));
+        assert!(!TrainModelOnSplit.checkpoint_slot(&a));
+    }
+
+    /// The slot reaches the trainer process as the contract's environment.
+    #[test]
+    fn the_slot_reaches_the_trainer_environment() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ctx = StageContext::for_test(td.path().to_path_buf(), td.path().join("stage"));
+        let mut args = minimal_args();
+        args.device = "cpu".into();
+        let config = td.path().join("train_config.json");
+        let env_of = |ctx: &StageContext| -> Vec<(String, String)> {
+            let launch = trainer_command(ctx, &args, &config).unwrap();
+            let mut env: Vec<_> = launch
+                .env
+                .into_iter()
+                .filter(|(k, _)| k.starts_with("BLUT_"))
+                .collect();
+            env.sort();
+            env
+        };
+        assert!(env_of(&ctx).is_empty(), "no slot, no contract variables");
+        let slot = td.path().join("slot");
+        ctx.checkpoint = Some(blut::framework::stage_checkpoint::CheckpointSlot::new(
+            slot.clone(),
+            true,
+            "job-1",
+            "job-1/inv/2",
+        ));
+        let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
+        assert_eq!(
+            env_of(&ctx),
+            vec![
+                pair("BLUT_ATTEMPT_ID", "job-1/inv/2"),
+                pair("BLUT_CHECKPOINT_DIR", slot.to_str().unwrap()),
+                pair("BLUT_RESUME", "1"),
+                pair("BLUT_RUN_ID", "job-1"),
+            ]
+        );
+    }
+
+    /// Under `--launcher slurm` the step carries the name the engine records
+    /// with the BLUT job, so `blut cancel` can stop a Slurm job that outlived
+    /// the process that started it.
+    #[test]
+    fn a_slurm_step_is_named_after_the_job_and_node() {
+        let td = tempfile::tempdir().unwrap();
+        let job_dir = td.path().join("20261029-120000-1");
+        let mut ctx = StageContext::for_test(job_dir.clone(), job_dir.join("stage"));
+        ctx.launch_target = LaunchTarget::Slurm;
+        ctx.node_idx = 2;
+        let mut args = minimal_args();
+        args.device = "cpu".into();
+        let launch = trainer_command(&ctx, &args, &td.path().join("c.json")).unwrap();
+        assert_eq!(launch.cmdline[0], "srun");
+        assert!(
+            launch
+                .cmdline
+                .contains(&"--job-name=blut-20261029-120000-1-2".to_string()),
+            "{:?}",
+            launch.cmdline
         );
     }
 

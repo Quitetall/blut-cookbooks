@@ -5,16 +5,13 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::backends::HfTrainerBackend;
-use crate::backends::hf_trainer::{
-    HfTrainerJob, HfTrainerRunner, ImageTextOpts, PeftConfig, StatusLine,
-};
+use crate::backends::hf_trainer::{HfTrainerJob, HfTrainerRunner, ImageTextOpts, PeftConfig};
 use blut::artifacts::{DatasetJsonl, HfCheckpoint};
 use blut::framework::artifact::ContentHash;
 use blut::framework::compat::Compatible;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
-use blut::framework::status::StageEvent;
 
 pub struct HfSftTrain;
 impl Compatible<HfTrainerBackend> for HfSftTrain {}
@@ -187,69 +184,13 @@ impl Stage for HfSftTrain {
             dpo: None,
             nproc_per_node: args.nproc_per_node,
             nnodes: args.nnodes,
+            launch_target: ctx.launch_target,
+            slurm_job_name: Some(ctx.slurm_job_name()),
             opts: args.opts.clone(),
         };
 
-        // Fan tqdm-style step events into the executor's status
-        // broadcast. The runner's `StatusLine::Step` carries
-        // optional loss + lr; pass them through as `StageStep`.
-        let status_tx = ctx.status_tx.clone();
-        let node_idx = ctx.node_idx;
-        let cb = Box::new(move |s: StatusLine| match s {
-            StatusLine::Step {
-                step,
-                total,
-                loss,
-                lr,
-                grad_norm,
-                tokens_per_second,
-            } => {
-                let mut update = serde_json::json!({
-                    "kind": "hf_step",
-                    "step": step,
-                    "total": total,
-                    "loss": loss,
-                    "lr": lr,
-                });
-                // Only the image_text path reports these; leave the original
-                // event shape alone when absent.
-                if let Some(g) = grad_norm {
-                    update["grad_norm"] = g.into();
-                }
-                if let Some(t) = tokens_per_second {
-                    update["tokens_per_second"] = t.into();
-                }
-                let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx,
-                    stage_name: HfSftTrain::NAME.to_string(),
-                    update,
-                });
-            }
-            StatusLine::Resumed { step, path } => {
-                let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx,
-                    stage_name: HfSftTrain::NAME.to_string(),
-                    update: serde_json::json!({
-                        "kind": "hf_resumed",
-                        "step": step,
-                        "path": path,
-                    }),
-                });
-            }
-            StatusLine::Saved { path } => {
-                let _ = status_tx.send(StageEvent::StageStep {
-                    node_idx,
-                    stage_name: HfSftTrain::NAME.to_string(),
-                    update: serde_json::json!({
-                        "kind": "hf_saved",
-                        "path": path,
-                    }),
-                });
-            }
-            StatusLine::Done { .. } | StatusLine::Failed { .. } => {
-                // Terminal events — handled via the run's return value.
-            }
-        }) as Box<dyn Fn(StatusLine) + Send + Sync>;
+        // The wrapper's progress, relayed in the engine's trainer format.
+        let cb = super::forward_status(ctx, HfSftTrain::NAME);
 
         let mut runner = HfTrainerRunner::new();
         let result = runner
@@ -268,7 +209,7 @@ impl Stage for HfSftTrain {
             base_model: args.base_model.clone(),
             method_tag: args.method.clone(),
             content_hash,
-            final_loss: result.final_loss.unwrap_or(0.0),
+            final_loss: result.final_loss,
         })
     }
 }
@@ -407,6 +348,27 @@ mod tests {
     #[test]
     fn deterministic_false() {
         const { assert!(!<HfSftTrain as Stage>::DETERMINISTIC) };
+    }
+
+    /// An absent final loss survives both ways the engine carries a stage's
+    /// output: the JSON projection that rebases its paths, and the erased
+    /// bincode payload. A `NaN` standing in for "none" would break the first;
+    /// `skip_serializing_if` on the field would break the second.
+    #[test]
+    fn an_absent_final_loss_survives_the_engines_output_handling() {
+        let ckpt = HfCheckpoint {
+            path: "/c".into(),
+            base_model: "m".into(),
+            method_tag: "full".into(),
+            content_hash: ContentHash::of_bytes(b""),
+            final_loss: None,
+        };
+        let json = serde_json::to_value(&ckpt).unwrap();
+        let back: HfCheckpoint = serde_json::from_value(json).unwrap();
+        assert_eq!(back.final_loss, None);
+        let erased = blut::framework::stage::ErasedArtifact::from_typed(&ckpt).unwrap();
+        let back: HfCheckpoint = erased.into_typed().unwrap();
+        assert_eq!(back.final_loss, None);
     }
 
     fn minimal_args() -> serde_json::Value {

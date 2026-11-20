@@ -16,7 +16,7 @@ use blut::recipes::recipe::Recipe;
 use blut_backends::stages::split_train_eval::{Args as SplitArgs, SplitTrainEval};
 use blut_backends::stages::take_eval::TakeEval;
 
-use crate::recipes::shared::{DatasetSelect, TrainShape};
+use crate::recipes::shared::{CheckpointOptions, DatasetSelect, TrainShape};
 use crate::stages::IngredientCfg;
 use crate::stages::evaluate_model::{EvaluateHeldOut, HeldOutArgs};
 use crate::stages::load_dataset::{Args as LoadArgs, LoadDataset};
@@ -68,6 +68,10 @@ pub struct Args {
     /// `max_seq_len`.
     #[serde(flatten)]
     pub shape: TrainShape,
+    /// `checkpoint_every_steps`, `checkpoint_every_secs`, `log_every_steps`,
+    /// `train_attempts`.
+    #[serde(flatten)]
+    pub checkpoints: CheckpointOptions,
 }
 
 fn default_split() -> String {
@@ -151,9 +155,14 @@ impl Recipe for TrainFromDataset {
                 train_args(&args),
                 TakeEval,
                 blut_backends::stages::take_eval::Args::default(),
-            )
-            .merge(EvaluateHeldOut, held_out_args(&args))
-            .finish();
+            );
+        // Retries apply to both fork branches; `take_eval` is cheap and
+        // deterministic, so retrying it costs nothing.
+        let plan = match args.checkpoints.train_retry()? {
+            Some(policy) => plan.with_retry(policy),
+            None => plan,
+        };
+        let plan = plan.merge(EvaluateHeldOut, held_out_args(&args)).finish();
         Ok(plan)
     }
 }
@@ -214,6 +223,9 @@ fn train_args(args: &Args) -> TrainArgs {
         parallel_strategy: args.shape.parallel_strategy,
         text_field: args.shape.text_field.clone(),
         max_seq_len: args.shape.max_seq_len,
+        checkpoint_every_steps: args.checkpoints.checkpoint_every_steps,
+        checkpoint_every_secs: args.checkpoints.checkpoint_every_secs,
+        log_every_steps: args.checkpoints.log_every_steps,
     }
 }
 
@@ -231,6 +243,7 @@ mod tests {
             split: "train".into(),
             dataset: DatasetSelect::default(),
             shape: TrainShape::default(),
+            checkpoints: CheckpointOptions::default(),
             model: IngredientCfg {
                 kind: "model".into(),
                 name: "from_pretrained".into(),
@@ -370,9 +383,32 @@ mod tests {
             "max_seq_len",
             "subset",
             "max_samples",
+            "checkpoint_every_steps",
+            "checkpoint_every_secs",
+            "log_every_steps",
+            "train_attempts",
         ] {
             assert!(json.get(key).is_none(), "{key} serialized at its default");
         }
+    }
+
+    #[test]
+    fn checkpoint_options_reach_the_train_stage_from_the_top_level() {
+        let mut json = serde_json::to_value(args()).unwrap();
+        json["checkpoint_every_steps"] = 25.into();
+        json["log_every_steps"] = 1.into();
+        json["train_attempts"] = 3.into();
+        let a: Args = serde_json::from_value(json).unwrap();
+        let t = train_args(&a);
+        assert_eq!(t.checkpoint_every_steps, Some(25));
+        assert_eq!(t.checkpoint_every_secs, None);
+        assert_eq!(t.log_every_steps, Some(1));
+        // Still the same 5-node plan, with retries on the training stage.
+        let plan = TrainFromDataset.compile(a).unwrap().into_compiled();
+        assert_eq!(plan.n_nodes(), 5);
+        let mut bad = args();
+        bad.checkpoints.train_attempts = Some(0);
+        assert!(TrainFromDataset.compile(bad).is_err());
     }
 
     /// The shared structs are flattened: users still write every field at the

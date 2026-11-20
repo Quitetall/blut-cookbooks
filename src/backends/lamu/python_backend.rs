@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::oneshot;
 
 use crate::backend::{StatusFn, TrainArtifact, TrainBackend};
@@ -47,10 +46,14 @@ pub struct PythonTrainBackend {
     /// old trainers (no heartbeats) are unaffected.
     pub liveness_timeout: Option<Duration>,
     /// Where to place the trainer (#3). `Local` (default) spawns it directly
-    /// here (byte-identical to the original behavior); `Slurm`/`Ray` wrap the
-    /// `python script spec` invocation via the matching launcher so the SAME
-    /// streaming/cancel path runs against a cluster-placed job.
+    /// here; `Slurm` runs it as one `srun` step, placed by
+    /// `distributed::training_argv_named` like every other training process,
+    /// with the SAME streaming/cancel path. Any other target is refused.
     launch_target: blut::config::launcher::LaunchTarget,
+    /// The Slurm job name: the stage's `StageContext::slurm_job_name()`, which
+    /// the engine records with the BLUT job. `None` keeps the generic
+    /// `blut-train`, which `blut cancel` and `plan resume` cannot find.
+    job_name: Option<String>,
     child_pid: Arc<Mutex<Option<u32>>>,
 }
 
@@ -62,6 +65,7 @@ impl PythonTrainBackend {
             env: Vec::new(),
             liveness_timeout: None,
             launch_target: blut::config::launcher::LaunchTarget::Local,
+            job_name: None,
             child_pid: Arc::new(Mutex::new(None)),
         }
     }
@@ -82,6 +86,40 @@ impl PythonTrainBackend {
         self.launch_target = target;
         self
     }
+
+    /// Name the Slurm job. A stage passes `ctx.slurm_job_name()`, so
+    /// `blut cancel` can stop, and `plan resume` can see, a trainer the BLUT
+    /// process that started it left running.
+    pub fn with_job_name(mut self, name: impl Into<String>) -> Self {
+        self.job_name = Some(name.into());
+        self
+    }
+
+    /// The trainer's command line for `spec_json`:
+    /// `python [torchrun prefix] trainer.py <spec>`, placed where
+    /// `launch_target` says (`srun --job-name=<job_name> …` under Slurm).
+    pub(crate) fn command(&self, spec: &TrainSpec, spec_json: &str) -> Result<Vec<String>> {
+        let inner = [
+            self.trainer_script.display().to_string(),
+            spec_json.to_string(),
+        ];
+        // DDP: when nproc_per_node > 1 the trainer runs under torchrun, which
+        // initializes the process group; under Slurm each node resolves its
+        // own rank from the allocation.
+        let (program, argv) = crate::distributed::training_argv_named(
+            self.launch_target,
+            &self.python.display().to_string(),
+            spec.nproc_per_node,
+            spec.nnodes,
+            true,
+            &inner,
+            self.job_name.as_deref().unwrap_or("blut-train"),
+        )
+        .map_err(TrainError::other)?;
+        let mut cmdline = vec![program];
+        cmdline.extend(argv);
+        Ok(cmdline)
+    }
 }
 
 #[async_trait]
@@ -91,81 +129,29 @@ impl TrainBackend for PythonTrainBackend {
         let spec_json = serde_json::to_string(&spec)
             .map_err(|e| TrainError::other(format!("serialize TrainSpec for trainer.py: {e}")))?;
 
-        // Local spawns the trainer directly (byte-identical to the original);
-        // Slurm/Ray wrap `python script spec` via the launcher (program/argv/env
-        // are launcher data) but keep the SAME streaming + cancel path below.
-        //
-        // DDP: when nproc_per_node > 1, launch via `torchrun --nproc_per_node=N`
-        // instead of bare python, so the trainer auto-initializes DDP.
-        use crate::distributed::launch_prefix;
-        use blut::config::launcher::{LaunchTarget, launcher_for};
-        let nproc = spec.nproc_per_node.max(1);
-        let nnodes = spec.nnodes.max(1);
-        let mut cmd = match self.launch_target {
-            LaunchTarget::Local => {
-                let mut c = Command::new(&self.python);
-                for arg in launch_prefix(nproc, nnodes).map_err(TrainError::other)? {
-                    c.arg(arg);
-                }
-                c.arg(&self.trainer_script).arg(&spec_json);
-                c
-            }
-            target => {
-                let mut inner_args =
-                    vec![self.trainer_script.display().to_string(), spec_json.clone()];
-                // Slurm/Ray: the same torchrun prefix the Local arm builds.
-                // It used to be assembled separately here, and got it wrong:
-                // `--standalone` went in unconditionally and `--nnodes N` was
-                // appended after it. `--standalone` *is* a single-node
-                // rendezvous and overrides `--nnodes`, so a multi-node job
-                // wrapped by a launcher silently ran as N disconnected
-                // single-node jobs — and no `--node_rank` or `--rdzv_endpoint`
-                // was ever passed for the nodes to find each other with.
-                let prefix = launch_prefix(nproc, nnodes).map_err(TrainError::other)?;
-                for (i, arg) in prefix.into_iter().enumerate() {
-                    inner_args.insert(i, arg);
-                }
-                let inner_prog = self.python.display().to_string();
-                let mut full_inner = vec![inner_prog];
-                full_inner.extend(inner_args);
-                let w = launcher_for(target)
-                    .wrap("blut-train", &full_inner)
-                    .map_err(|e| TrainError::other(format!("launcher wrap: {e}")))?;
-                let mut c = Command::new(&w.program);
-                c.args(&w.args);
-                for (k, v) in &w.env {
-                    c.env(k, v);
-                }
-                c
-            }
-        };
+        let cmdline = self.command(&spec, &spec_json)?;
         // For DDP: don't pin CUDA_VISIBLE_DEVICES — torchrun manages LOCAL_RANK
-        if nproc <= 1 {
-            // Single-GPU: could pin device here if needed
-        }
-        for (k, v) in &self.env {
-            cmd.env(k, v);
-        }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // KILL-1: new session/process group so cancel can killpg the
-        // whole tree (DataLoader workers, torchrun ranks) — not just
-        // this direct child.
-        #[cfg(unix)]
-        {
-            // tokio::process::Command exposes `pre_exec` inherently
-            // (no std CommandExt import needed).
-            // SAFETY: setsid is async-signal-safe; pre_exec_setsid
-            // allocates nothing. Sound to run between fork and exec.
-            #[allow(unsafe_code)]
-            unsafe {
-                cmd.pre_exec(blut::python_kill::pre_exec_setsid);
-            }
-        }
+        let env = self.env.clone();
 
-        let mut child = cmd.spawn().map_err(|e| {
+        // A local run is contained (memory cap, peak, tree kill; the tree
+        // also dies if this future is dropped), and on Unix the child leads
+        // its own process group (KILL-1), so cancel reaches DataLoader workers
+        // and torchrun ranks; see crate::local_stage.
+        let mut child = crate::local_stage::spawn(
+            self.launch_target,
+            "blut-lamu_trainer",
+            &cmdline,
+            None,
+            &env,
+            |cmd| {
+                cmd.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true);
+            },
+        )
+        .await
+        .map_err(|e| {
             TrainError::Trainer(format!(
                 "spawn {} {}: {}",
                 self.python.display(),
@@ -181,14 +167,10 @@ impl TrainBackend for PythonTrainBackend {
             blut::python_kill::register_child(blut::python_kill::capture_identity(pid));
         }
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| TrainError::Trainer("trainer subprocess stdout pipe missing".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| TrainError::Trainer("trainer subprocess stderr pipe missing".into()))?;
+        let stdout =
+            child.child_mut().stdout.take().ok_or_else(|| {
+                TrainError::Trainer("trainer subprocess stdout pipe missing".into())
+            })?;
 
         let (artifact_tx, artifact_rx) = oneshot::channel();
         let started = Instant::now();
@@ -250,22 +232,27 @@ impl TrainBackend for PythonTrainBackend {
         // Stderr drain. Forward to tracing so a buggy trainer's
         // python traceback doesn't disappear into a closed pipe. Stderr
         // chatter (e.g. tqdm) is also a liveness signal.
+        // The pump also records the systemd backend's `Memory peak:` line.
         let activity_stderr = Arc::clone(&last_activity);
-        let stderr_reader = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                *activity_stderr.lock() = Instant::now();
-                tracing::info!(target: "blut::trainer_stderr", "{}", line);
-            }
-        });
+        if !child.pump_stderr(move |line| {
+            *activity_stderr.lock() = Instant::now();
+            tracing::info!(target: "blut::trainer_stderr", "{}", line);
+        }) {
+            return Err(TrainError::Trainer(
+                "trainer subprocess stderr pipe missing".into(),
+            ));
+        }
 
         // D3 watchdog task (only when configured). Ticks at min(timeout/4,
-        // 30s); on idle > timeout it SIGTERMs the child group and records
-        // a reason. Aborted below once the child exits.
+        // 30s); on idle > timeout it records a reason and fires
+        // `watchdog_kill`, and the wait below stops the whole tree
+        // (local_stage::stop_tree: the backend's teardown, or SIGTERM then
+        // SIGKILL to the process group). Aborted below once the child exits.
+        let watchdog_kill = tokio_util::sync::CancellationToken::new();
         let watchdog = self.liveness_timeout.map(|timeout| {
             let activity = Arc::clone(&last_activity);
-            let pid_handle = Arc::clone(&self.child_pid);
             let reason = Arc::clone(&watchdog_reason);
+            let kill = watchdog_kill.clone();
             tokio::spawn(async move {
                 let tick = std::cmp::min(timeout / 4, Duration::from_secs(30))
                     .max(Duration::from_millis(100));
@@ -275,32 +262,21 @@ impl TrainBackend for PythonTrainBackend {
                     if idle <= timeout {
                         continue;
                     }
-                    // Idle past the limit — record the reason (always) and
-                    // kill the child group if we have its pid, then stop.
                     *reason.lock() = Some(format!(
                         "liveness watchdog: no output for {idle:?} (limit {timeout:?})"
                     ));
-                    // Bind the Copy pid (drop the guard) before the await.
-                    let pid = *pid_handle.lock();
-                    match pid {
-                        Some(pid) => {
-                            tracing::warn!(
-                                "liveness watchdog: no trainer output for {idle:?} (> {timeout:?}); \
-                                 killing pid {pid}"
-                            );
-                            blut::python_kill::graceful_kill_pid(pid, Duration::from_secs(10)).await;
-                        }
-                        None => tracing::warn!(
-                            "liveness watchdog: idle {idle:?} but no child pid to kill"
-                        ),
-                    }
+                    tracing::warn!(
+                        "liveness watchdog: no trainer output for {idle:?} (> {timeout:?}); \
+                         stopping it"
+                    );
+                    kill.cancel();
                     return;
                 }
             })
         });
 
-        let exit_status = child
-            .wait()
+        // `None`: the watchdog fired and the tree was killed.
+        let exit_status = crate::local_stage::wait_or_cancel(&mut child, &watchdog_kill)
             .await
             .map_err(|e| TrainError::Trainer(format!("wait for trainer.py: {e}")))?;
 
@@ -313,7 +289,6 @@ impl TrainBackend for PythonTrainBackend {
         // do once the child exits). Awaiting here serializes the
         // final on_status callback before we return.
         let _ = stdout_reader.await;
-        let _ = stderr_reader.await;
 
         if let Some(pid) = self.child_pid.lock().take() {
             blut::python_kill::unregister_child(pid);
@@ -333,6 +308,9 @@ impl TrainBackend for PythonTrainBackend {
         if let Some(error) = last_failed {
             return Err(TrainError::Trainer(error));
         }
+        let exit_status = exit_status.ok_or_else(|| {
+            TrainError::Trainer("trainer.py was killed by the liveness watchdog".into())
+        })?;
         if !exit_status.success() {
             return Err(TrainError::Trainer(format!(
                 "trainer.py exited with {exit_status} and emitted no Failed status"
@@ -364,6 +342,83 @@ impl TrainBackend for PythonTrainBackend {
 
 async fn graceful_kill(pid: u32) {
     blut::python_kill::graceful_kill_pid(pid, Duration::from_secs(10)).await
+}
+
+/// Where the trainer runs, and what its Slurm job is called.
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use blut::config::launcher::LaunchTarget;
+    use blut::spec::{DatasetSource, Method, Optim, TrainSpec};
+
+    fn spec() -> TrainSpec {
+        TrainSpec {
+            base_model: "org/m".into(),
+            output_name: "placement".into(),
+            output_dir: PathBuf::from("out"),
+            method: Method::Full,
+            dataset: DatasetSource::JsonlPath {
+                path: PathBuf::from("x.jsonl"),
+            },
+            optimizer: Optim::AdamW,
+            lr: 2e-4,
+            epochs: 1,
+            batch_size: 1,
+            grad_accum: 1,
+            seq_len: 512,
+            seed: 42,
+            quant: "Q4_K_M".into(),
+            skip_convert: true,
+            dpo_beta: None,
+            nproc_per_node: 1,
+            nnodes: 1,
+        }
+    }
+
+    fn backend() -> PythonTrainBackend {
+        PythonTrainBackend::new("py".into(), "trainer.py".into())
+    }
+
+    #[test]
+    fn a_local_run_is_the_bare_trainer() {
+        assert_eq!(
+            backend().command(&spec(), "{}").unwrap(),
+            ["py", "trainer.py", "{}"]
+        );
+    }
+
+    /// The name the stage hands over is the Slurm job's name, which the
+    /// engine records with the BLUT job: `blut cancel` and `plan resume` find
+    /// the job by it. The generic `blut-train` they cannot.
+    #[test]
+    fn a_slurm_step_carries_the_name_it_was_given() {
+        let cmd = backend()
+            .with_launch_target(LaunchTarget::Slurm)
+            .with_job_name("blut-20261030-120000-1-2")
+            .command(&spec(), "{}")
+            .unwrap();
+        assert_eq!(cmd[0], "srun");
+        assert!(
+            cmd.contains(&"--job-name=blut-20261030-120000-1-2".to_string()),
+            "{cmd:?}"
+        );
+        assert!(!cmd.iter().any(|a| a == "--job-name=blut-train"), "{cmd:?}");
+        assert_eq!(cmd[cmd.len() - 3..], ["py", "trainer.py", "{}"]);
+    }
+
+    /// A placement this backend cannot honor is an error, never a local run.
+    #[test]
+    fn another_launcher_is_refused() {
+        let err = backend()
+            .with_launch_target(LaunchTarget::Ray)
+            .command(&spec(), "{}")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("training cannot run under --launcher"),
+            "{err}"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]

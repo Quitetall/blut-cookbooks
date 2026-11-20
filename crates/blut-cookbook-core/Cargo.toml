@@ -7,12 +7,12 @@
 # Package name: blut-cookbook-core (parent · child · child naming).
 [package]
 name = "blut-cookbook-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Brian Lam"]
 license = "AGPL-3.0-or-later"
 description = "Core BLUT cookbook — generic ML training primitives (data/optimizer/scheduler/loss/checkpoint)."
-rust-version = "1.85"
+rust-version = "1.99"
 repository = "https://github.com/Quitetall/blut-cookbooks"
 
 [lib]
@@ -23,8 +23,8 @@ name = "blut-core"
 path = "src/main.rs"
 
 [dependencies]
-blut = { version = "=0.2.0-alpha.1", default-features = false }
-blut-backends = { package = "blut-cookbook-standard", path = "../..", version = "=0.1.0" }
+blut = { version = "=0.2.0-alpha.2", default-features = false }
+blut-backends = { package = "blut-cookbook-standard", path = "../..", version = "=0.2.0" }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

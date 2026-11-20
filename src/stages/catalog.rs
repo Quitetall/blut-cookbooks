@@ -29,6 +29,8 @@ pub fn make_stage(name: &str) -> Option<Box<dyn StageDyn>> {
         "eval_lm_harness" => Box::new(EvalLmHarness),
         "eval_judge" => Box::new(EvalJudge),
         "merge_reports" => Box::new(MergeReports),
+        "to_checks_jsonl" => Box::new(ToChecksJsonl),
+        "from_checks_jsonl" => Box::new(FromChecksJsonl),
         _ => return None,
     })
 }
@@ -54,6 +56,8 @@ pub fn names() -> &'static [&'static str] {
         "eval_lm_harness",
         "eval_judge",
         "merge_reports",
+        "to_checks_jsonl",
+        "from_checks_jsonl",
     ]
 }
 

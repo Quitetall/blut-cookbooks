@@ -90,6 +90,8 @@ async fn merge_image_text(
         dpo: None,
         nproc_per_node: 1,
         nnodes: 1,
+        launch_target: ctx.launch_target,
+        slurm_job_name: Some(ctx.slurm_job_name()),
         opts: ImageTextOpts {
             arch: "image_text".into(),
             adapter_path: Some(input.path.clone()),
@@ -189,7 +191,7 @@ mod tests {
             base_model: "Qwen/Qwen3-7B".into(),
             method_tag: method.into(),
             content_hash: ContentHash::of_bytes(b"x"),
-            final_loss: 0.5,
+            final_loss: Some(0.5),
         }
     }
 

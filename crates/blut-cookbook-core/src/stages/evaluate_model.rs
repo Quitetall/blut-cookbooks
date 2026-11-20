@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use blut::artifacts::{DatasetJsonl, EvalReport, HfCheckpoint};
+use blut::config::launcher::LaunchTarget;
 use blut::framework::error::StageError;
 use blut::framework::resource::Resource;
 use blut::framework::stage::{Stage, StageContext};
@@ -101,7 +102,7 @@ fn default_device() -> String {
     "cuda".into()
 }
 
-fn resolve_dataset(ctx: &StageContext, args: &Args) -> Result<PathBuf, StageError> {
+async fn resolve_dataset(ctx: &StageContext, args: &Args) -> Result<PathBuf, StageError> {
     match (&args.dataset_path, &args.hf_name) {
         (Some(_), Some(_)) => Err(StageError::BadInput(
             "evaluate_model: pass exactly one of dataset_path / hf_name, not both".into(),
@@ -120,21 +121,37 @@ fn resolve_dataset(ctx: &StageContext, args: &Args) -> Result<PathBuf, StageErro
         }
         (None, Some(name)) => {
             let output = ctx.stage_dir.join("evaluation_dataset.jsonl");
-            let mut cmd = std::process::Command::new("python3");
-            cmd.args(["-m", "blut_core.load_dataset", "--name", name, "--split"])
-                .arg(&args.split)
-                .arg("--output")
-                .arg(&output);
+            let mut cmdline = vec![
+                blut_backends::local_stage::python(),
+                "-m".to_string(),
+                "blut_core.load_dataset".to_string(),
+                "--name".to_string(),
+                name.clone(),
+                "--split".to_string(),
+                args.split.clone(),
+                "--output".to_string(),
+                output.display().to_string(),
+            ];
             if let Some(subset) = &args.subset {
-                cmd.args(["--subset", subset]);
+                cmdline.extend(["--subset".to_string(), subset.clone()]);
             }
             if let Some(max) = args.max_samples {
-                cmd.arg("--max-samples").arg(max.to_string());
+                cmdline.extend(["--max-samples".to_string(), max.to_string()]);
             }
-            let status = cmd.status().map_err(|error| {
-                StageError::Backend(anyhow::anyhow!(
+            let status = blut_backends::local_stage::run(
+                ctx,
+                LaunchTarget::Local,
+                "blut-load_dataset",
+                &cmdline,
+                None,
+                &[],
+            )
+            .await
+            .map_err(|e| match e {
+                StageError::Backend(error) => StageError::Backend(anyhow::anyhow!(
                     "failed to run blut_core.load_dataset: {error}"
-                ))
+                )),
+                other => other,
             })?;
             if !status.success() {
                 return Err(StageError::Backend(anyhow::anyhow!(
@@ -153,7 +170,7 @@ fn resolve_dataset(ctx: &StageContext, args: &Args) -> Result<PathBuf, StageErro
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_evaluator(
+async fn run_evaluator(
     ctx: &StageContext,
     checkpoint_path: &Path,
     dataset_path: &Path,
@@ -184,6 +201,7 @@ fn run_evaluator(
         },
         "blut_core.evaluator",
     )
+    .await
 }
 
 #[async_trait]
@@ -201,7 +219,7 @@ impl Stage for EvaluateModel {
         input: HfCheckpoint,
         args: &Args,
     ) -> Result<EvalReport, StageError> {
-        let dataset_path = resolve_dataset(ctx, args)?;
+        let dataset_path = resolve_dataset(ctx, args).await?;
         run_evaluator(
             ctx,
             &input.path,
@@ -213,6 +231,7 @@ impl Stage for EvaluateModel {
             args.text_field.as_deref(),
             args.max_seq_len,
         )
+        .await
     }
 }
 
@@ -242,6 +261,7 @@ impl Stage for EvaluateLoadedDataset {
             args.text_field.as_deref(),
             args.max_seq_len,
         )
+        .await
     }
 }
 
@@ -278,6 +298,7 @@ impl Stage for EvaluateHeldOut {
             args.text_field.as_deref(),
             args.max_seq_len,
         )
+        .await
     }
 }
 
@@ -296,8 +317,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_dataset_source_resolves() {
+    #[tokio::test]
+    async fn local_dataset_source_resolves() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("eval.jsonl");
         std::fs::write(&path, "{}\n").unwrap();
@@ -318,6 +339,6 @@ mod tests {
             text_field: None,
             max_seq_len: None,
         };
-        assert_eq!(resolve_dataset(&ctx, &args).unwrap(), path);
+        assert_eq!(resolve_dataset(&ctx, &args).await.unwrap(), path);
     }
 }

@@ -44,6 +44,20 @@ impl<B: TrainingBackend> Compatible<B> for EvalLmHarness {}
 impl<B: TrainingBackend> Compatible<B> for EvalJudge {}
 impl<B: TrainingBackend> Compatible<B> for MergeReports {}
 impl<B: TrainingBackend> Compatible<B> for MergeLora {}
+impl<B: TrainingBackend> Compatible<B> for ToChecksJsonl {}
+impl<B: TrainingBackend> Compatible<B> for FromChecksJsonl {}
+
+// ── The engine's built-in checks ───────────────────────────────
+//
+// `check_jsonl` and `assert` (ADR 0091) are engine stages, so the engine
+// cannot name these backends and the impls live here. With them a compiled
+// recipe of either backend can put a guard between `to_checks_jsonl` and
+// `from_checks_jsonl`; declared recipes need no impl.
+
+impl Compatible<LamuTrainerBackend> for blut::checks::CheckJsonl {}
+impl Compatible<LamuTrainerBackend> for blut::checks::Assert {}
+impl Compatible<HfTrainerBackend> for blut::checks::CheckJsonl {}
+impl Compatible<HfTrainerBackend> for blut::checks::Assert {}
 
 // ── LAMU-coupled stages ────────────────────────────────────────
 //
@@ -91,6 +105,10 @@ mod tests {
         _agnostic_witness::<SplitTrainEval>();
         _agnostic_witness::<TakeTrain>();
         _agnostic_witness::<TakeEval>();
+        _agnostic_witness::<ToChecksJsonl>();
+        _agnostic_witness::<FromChecksJsonl>();
+        _agnostic_witness::<blut::checks::CheckJsonl>();
+        _agnostic_witness::<blut::checks::Assert>();
     }
 
     #[test]
