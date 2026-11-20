@@ -99,9 +99,16 @@ def resolve_lora_regex(spec: Dict[str, Any], model_type: str, module_names: List
 
 
 def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY)
+    # Makes a rename in `path` durable. Not every platform can open a
+    # directory (Windows cannot), as in blut_core.checkpoint_slot.
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
     try:
         os.fsync(fd)
+    except OSError:
+        pass
     finally:
         os.close(fd)
 
@@ -147,7 +154,8 @@ def save_checkpoint(root: Path, step: int, consumed: int, model, optimizer, sche
         json.dumps({"step": step, "rows_consumed": consumed, **extra_state})
     )
     for f in [*(tmp / "adapter").iterdir(), tmp / "train_state.pt", tmp / "state.json"]:
-        with open(f, "rb") as fh:
+        # r+b: Windows fsyncs only through a handle with write access.
+        with open(f, "r+b") as fh:
             os.fsync(fh.fileno())
     _fsync_dir(tmp / "adapter")
     _fsync_dir(tmp)

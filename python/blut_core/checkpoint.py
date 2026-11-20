@@ -87,7 +87,9 @@ def save(payload: Dict[str, Any], path, *, contract: Optional[Iterable[str]] = N
     try:
         os.close(fd)  # torch.save writes by path
         torch.save(payload, tmp)
-        with tmp.open("rb") as f:
+        # r+b, not rb: Windows flushes (FlushFileBuffers) only through a
+        # handle with write access, and fails a read-only one with EBADF.
+        with tmp.open("r+b") as f:
             os.fsync(f.fileno())
         sha = _sha256(tmp)
         os.replace(tmp, path)
