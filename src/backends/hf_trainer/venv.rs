@@ -34,14 +34,71 @@ pub const REQUIRED_PKGS: &[&str] = &[
     "safetensors>=0.4,<1",
 ];
 
+/// A venv profile: one pinned dependency set, its own directory and its own
+/// version stamp. The original profile is the constants above; image-text
+/// fine-tuning gets a second one so it never shares a venv with it.
+pub struct VenvProfile {
+    pub version: &'static str,
+    pub pkgs: &'static [&'static str],
+    /// Env var overriding the venv directory.
+    pub env_var: &'static str,
+    /// Directory name under `<data_local_dir>/blut/`.
+    pub dir_name: &'static str,
+}
+
+/// The original profile: transformers 4.x, trl, bitsandbytes.
+pub const CAUSAL_LM_PROFILE: VenvProfile = VenvProfile {
+    version: VENV_VERSION,
+    pkgs: REQUIRED_PKGS,
+    env_var: "BLUT_HF_VENV",
+    dir_name: "hf-venv",
+};
+
+/// Bump when `IMAGE_TEXT_PKGS` changes.
+pub const IMAGE_TEXT_VENV_VERSION: &str = "2";
+
+/// Image-text (`AutoModelForImageTextToText`) fine-tuning. transformers 5.x is
+/// required for Idefics3/SmolVLM and Qwen3.5 loading in the form KnightLM's
+/// reference trainer uses, but the original profile pins `transformers<5`
+/// (and `trl`/`datasets` pins that go with it), and bumping that shared pin
+/// would change the training stack under every existing recipe. A separate
+/// profile leaves the original venv, and the recipes that use it, untouched.
+/// transformers/peft are pinned exactly to the reference trainer's
+/// `model/train/requirements.txt`.
+pub const IMAGE_TEXT_PKGS: &[&str] = &[
+    "transformers==5.5.3",
+    "peft==0.21.2",
+    "accelerate>=1.0,<2",
+    "safetensors>=0.4,<1",
+    "torch>=2.4,<3",
+    // Image processors (SmolVLM/Idefics3) import torchvision. Its metadata pins
+    // the exact torch it was built against, so the resolver keeps the pair
+    // matched; the floor is the torchvision that pairs with torch 2.4.
+    "torchvision>=0.19,<1",
+    "pillow>=10",
+    "num2words",
+];
+
+pub const IMAGE_TEXT_PROFILE: VenvProfile = VenvProfile {
+    version: IMAGE_TEXT_VENV_VERSION,
+    pkgs: IMAGE_TEXT_PKGS,
+    env_var: "BLUT_HF_VENV_IMAGE_TEXT",
+    dir_name: "hf-venv-image-text",
+};
+
 /// Resolve the venv root. `$BLUT_HF_VENV` env wins; default
 /// `~/.local/share/blut/hf-venv/`.
 pub fn venv_root() -> PathBuf {
-    if let Ok(p) = std::env::var("BLUT_HF_VENV") {
+    profile_root(&CAUSAL_LM_PROFILE)
+}
+
+/// Resolve a profile's venv root: its env var, else `<data_local_dir>/blut/<dir_name>`.
+pub fn profile_root(profile: &VenvProfile) -> PathBuf {
+    if let Ok(p) = std::env::var(profile.env_var) {
         return PathBuf::from(p);
     }
     let home = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    home.join("blut").join("hf-venv")
+    home.join("blut").join(profile.dir_name)
 }
 
 /// Path to the venv's Python interpreter. Caller-side; resolved
@@ -89,7 +146,12 @@ pub enum VenvError {
 ///   3. Neither → take lock, run `python -m venv`, `pip install`,
 ///      write marker, release lock.
 pub fn ensure_venv() -> Result<PathBuf, VenvError> {
-    let root = venv_root();
+    ensure_venv_profile(&CAUSAL_LM_PROFILE)
+}
+
+/// `ensure_venv` for any profile. Same locking, stamp and rebuild rules.
+pub fn ensure_venv_profile(profile: &VenvProfile) -> Result<PathBuf, VenvError> {
+    let root = profile_root(profile);
     let marker = marker_path(&root);
     let py = python_path(&root);
 
@@ -97,7 +159,7 @@ pub fn ensure_venv() -> Result<PathBuf, VenvError> {
     if marker.exists()
         && py.exists()
         && let Ok(s) = std::fs::read_to_string(&marker)
-        && s.trim() == VENV_VERSION
+        && s.trim() == profile.version
     {
         return Ok(py);
     }
@@ -145,15 +207,15 @@ pub fn ensure_venv() -> Result<PathBuf, VenvError> {
                 lock.display()
             );
             let _ = std::fs::remove_file(&lock);
-            return ensure_venv();
+            return ensure_venv_profile(profile);
         }
-        wait_for_marker(&marker, &py, Duration::from_secs(30 * 60))?;
+        wait_for_marker(&marker, &py, profile.version, Duration::from_secs(30 * 60))?;
         return Ok(py);
     }
 
     let result = (|| -> Result<(), VenvError> {
-        provision(&root)?;
-        std::fs::write(&marker, VENV_VERSION).map_err(|source| VenvError::Io {
+        provision(&root, profile.pkgs)?;
+        std::fs::write(&marker, profile.version).map_err(|source| VenvError::Io {
             path: marker.clone(),
             source,
         })?;
@@ -200,13 +262,18 @@ fn pid_in_lock_is_dead(_lock: &Path) -> bool {
     false
 }
 
-fn wait_for_marker(marker: &Path, py: &Path, timeout: Duration) -> Result<(), VenvError> {
+fn wait_for_marker(
+    marker: &Path,
+    py: &Path,
+    version: &str,
+    timeout: Duration,
+) -> Result<(), VenvError> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         if marker.exists()
             && py.exists()
             && let Ok(s) = std::fs::read_to_string(marker)
-            && s.trim() == VENV_VERSION
+            && s.trim() == version
         {
             return Ok(());
         }
@@ -217,7 +284,7 @@ fn wait_for_marker(marker: &Path, py: &Path, timeout: Duration) -> Result<(), Ve
     })
 }
 
-fn provision(root: &Path) -> Result<(), VenvError> {
+fn provision(root: &Path, pkgs: &[&str]) -> Result<(), VenvError> {
     tracing::info!(target: "blut::hf_venv", "provisioning HF venv at {}", root.display());
 
     let python3 = which::which("python3").map_err(|_| VenvError::PythonMissing {
@@ -255,7 +322,7 @@ fn provision(root: &Path) -> Result<(), VenvError> {
 
     let mut cmd = Command::new(&pip);
     cmd.arg("install");
-    for pkg in REQUIRED_PKGS {
+    for pkg in pkgs {
         cmd.arg(pkg);
     }
     let status = cmd.status().map_err(|source| VenvError::Io {
@@ -307,6 +374,49 @@ mod tests {
         if let Some(value) = prev {
             unsafe { std::env::set_var("BLUT_HF_VENV", value) };
         }
+    }
+
+    #[test]
+    fn image_text_profile_is_separate_from_the_original() {
+        let _guard = crate::TEST_ENV_LOCK.lock().expect("test env lock poisoned");
+        let prev = (
+            std::env::var("BLUT_HF_VENV").ok(),
+            std::env::var("BLUT_HF_VENV_IMAGE_TEXT").ok(),
+        );
+        unsafe {
+            std::env::remove_var("BLUT_HF_VENV");
+            std::env::remove_var("BLUT_HF_VENV_IMAGE_TEXT");
+        }
+        let a = profile_root(&CAUSAL_LM_PROFILE);
+        let b = profile_root(&IMAGE_TEXT_PROFILE);
+        assert_ne!(a, b);
+        assert!(b.ends_with("blut/hf-venv-image-text"));
+        // Overriding one must not move the other.
+        unsafe { std::env::set_var("BLUT_HF_VENV_IMAGE_TEXT", "/tmp/it-venv") };
+        assert_eq!(
+            profile_root(&IMAGE_TEXT_PROFILE),
+            PathBuf::from("/tmp/it-venv")
+        );
+        assert_eq!(profile_root(&CAUSAL_LM_PROFILE), a);
+        unsafe {
+            std::env::remove_var("BLUT_HF_VENV_IMAGE_TEXT");
+            if let Some(v) = prev.0 {
+                std::env::set_var("BLUT_HF_VENV", v);
+            }
+            if let Some(v) = prev.1 {
+                std::env::set_var("BLUT_HF_VENV_IMAGE_TEXT", v);
+            }
+        }
+    }
+
+    #[test]
+    fn original_profile_pins_are_unchanged() {
+        assert_eq!(CAUSAL_LM_PROFILE.version, "1");
+        assert!(CAUSAL_LM_PROFILE.pkgs.contains(&"transformers>=4.45,<5"));
+        assert!(IMAGE_TEXT_PROFILE.pkgs.contains(&"transformers==5.5.3"));
+        assert!(!IMAGE_TEXT_PROFILE.pkgs.iter().any(|p| p.starts_with("trl")));
+        assert!(IMAGE_TEXT_PROFILE.pkgs.contains(&"torchvision>=0.19,<1"));
+        assert_eq!(IMAGE_TEXT_PROFILE.version, "2");
     }
 
     #[test]

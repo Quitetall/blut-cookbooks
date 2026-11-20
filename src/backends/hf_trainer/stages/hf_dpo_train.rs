@@ -136,6 +136,7 @@ impl Stage for HfDpoTrain {
             nnodes: args.nnodes,
             launch_target: ctx.launch_target,
             slurm_job_name: Some(ctx.slurm_job_name()),
+            opts: Default::default(),
         };
 
         // The wrapper's progress, relayed in the engine's trainer format.

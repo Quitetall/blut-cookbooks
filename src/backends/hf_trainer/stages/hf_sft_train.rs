@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::backends::HfTrainerBackend;
-use crate::backends::hf_trainer::{HfTrainerJob, HfTrainerRunner, PeftConfig};
+use crate::backends::hf_trainer::{HfTrainerJob, HfTrainerRunner, ImageTextOpts, PeftConfig};
 use blut::artifacts::{DatasetJsonl, HfCheckpoint};
 use blut::framework::artifact::ContentHash;
 use blut::framework::compat::Compatible;
@@ -55,6 +55,10 @@ pub struct Args {
         skip_serializing_if = "crate::distributed::is_one"
     )]
     pub nnodes: u32,
+    /// Image-text arch + streaming/checkpoint/resume options (all optional;
+    /// see `ImageTextOpts`). Flattened: plain top-level keys in stage args.
+    #[serde(flatten)]
+    pub opts: ImageTextOpts,
 }
 
 fn default_method() -> String {
@@ -133,6 +137,15 @@ impl Stage for HfSftTrain {
             return Err(StageError::BadInput("base_model must be non-empty".into()));
         }
 
+        args.opts
+            .validate(&args.method, &args.extra)
+            .map_err(StageError::BadInput)?;
+        if args.opts.is_image_text() && !args.eval_dataset_path.is_empty() {
+            return Err(StageError::BadInput(
+                "arch image_text has no eval loop; eval_dataset_path must be empty".into(),
+            ));
+        }
+
         let output_dir = ctx.stage_dir.join("checkpoint");
         std::fs::create_dir_all(&output_dir).map_err(|source| StageError::Io {
             path: output_dir.clone(),
@@ -173,6 +186,7 @@ impl Stage for HfSftTrain {
             nnodes: args.nnodes,
             launch_target: ctx.launch_target,
             slurm_job_name: Some(ctx.slurm_job_name()),
+            opts: args.opts.clone(),
         };
 
         // The wrapper's progress, relayed in the engine's trainer format.
@@ -242,6 +256,7 @@ mod tests {
                     extra: serde_json::Map::new(),
                     nproc_per_node: 1,
                     nnodes: 1,
+                    opts: ImageTextOpts::default(),
                 },
             )
             .await;
@@ -270,10 +285,64 @@ mod tests {
                     extra: serde_json::Map::new(),
                     nproc_per_node: 1,
                     nnodes: 1,
+                    opts: ImageTextOpts::default(),
                 },
             )
             .await;
         assert!(matches!(r, Err(StageError::BadInput(_))));
+    }
+
+    #[tokio::test]
+    async fn image_text_rejects_qlora_and_eval_path() {
+        let td = tempfile::tempdir().unwrap();
+        for (method, eval) in [("qlora", ""), ("lora", "/e.jsonl")] {
+            let mut v = minimal_args();
+            v["arch"] = "image_text".into();
+            v["method"] = method.into();
+            v["eval_dataset_path"] = eval.into();
+            let args: Args = serde_json::from_value(v).unwrap();
+            let r = HfSftTrain.run(&ctx(td.path()), ds(td.path()), &args).await;
+            assert!(matches!(r, Err(StageError::BadInput(_))), "{method} {eval}");
+        }
+    }
+
+    #[test]
+    fn causal_lm_args_serialize_without_new_keys() {
+        // Cache-key stability for existing recipes.
+        let args: Args = serde_json::from_value(minimal_args()).unwrap();
+        let json = serde_json::to_value(&args).unwrap();
+        let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "alpha",
+                "base_model",
+                "batch_size",
+                "epochs",
+                "eval_dataset_path",
+                "extra",
+                "grad_accum",
+                "lr",
+                "method",
+                "rank",
+                "seed",
+                "seq_len"
+            ]
+        );
+    }
+
+    #[test]
+    fn image_text_options_parse_from_stage_args() {
+        let mut v = minimal_args();
+        v["arch"] = "image_text".into();
+        v["method"] = "lora".into();
+        v["save_steps"] = 500.into();
+        v["dataset_shards"] = serde_json::json!(["/a.jsonl"]);
+        let args: Args = serde_json::from_value(v).unwrap();
+        assert!(args.opts.is_image_text());
+        assert_eq!(args.opts.save_steps, Some(500));
+        assert!(args.opts.validate(&args.method, &args.extra).is_ok());
     }
 
     #[test]
