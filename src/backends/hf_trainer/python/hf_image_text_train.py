@@ -75,6 +75,69 @@ def opt(spec: Dict[str, Any], key: str) -> Any:
     return DEFAULTS[key] if value is None else value
 
 
+# Modules whose rows `trainable_token_indices` may name. `lm_head` is only
+# valid on an untied head (a tied head shares the embedding's rows).
+TOKEN_TARGETS = ("embed_tokens", "lm_head")
+
+
+def resolve_token_indices(spec_value: Any) -> Optional[Dict[str, List[int]]]:
+    """Expand the job's `trainable_token_indices` ({module: [ids] | {start, end}})
+    into sorted id lists; None when unset. Refuses anything malformed."""
+    if not spec_value:
+        return None
+    out: Dict[str, List[int]] = {}
+    for name, rows in spec_value.items():
+        if name not in TOKEN_TARGETS:
+            raise ValueError(f"trainable_token_indices key {name!r} must be one of {TOKEN_TARGETS}")
+        if isinstance(rows, dict):
+            start, end = int(rows["start"]), int(rows["end"])
+            ids = list(range(start, end))
+        else:
+            ids = sorted({int(i) for i in rows})
+        if not ids or ids[0] < 0:
+            raise ValueError(f"trainable_token_indices[{name!r}] is empty or negative")
+        out[name] = ids
+    return out
+
+
+def check_extended_vocab(model, tokenizer, indices: Dict[str, List[int]]) -> None:
+    """The base snapshot must already be the extended one: the tokenizer and both
+    matrices have the same number of rows, every named row exists, and an
+    `lm_head` entry needs an untied head. Nothing is resized here: the new rows'
+    initial values are a function of the snapshot builder (KnightLM `ctok
+    build-base`), and a silent resize would train on arbitrary rows."""
+    embed = model.get_input_embeddings().weight
+    head = model.get_output_embeddings().weight
+    rows = embed.shape[0]
+    if len(tokenizer) != rows:
+        raise ValueError(
+            f"tokenizer has {len(tokenizer)} entries but embed_tokens has {rows} rows: "
+            "the base snapshot is not the extended one"
+        )
+    if head.shape[0] != rows:
+        raise ValueError(f"lm_head has {head.shape[0]} rows, embed_tokens {rows}")
+    for name, ids in indices.items():
+        if ids[-1] >= rows:
+            raise ValueError(f"trainable_token_indices[{name!r}] names row {ids[-1]} >= {rows}")
+    if "lm_head" in indices and head.data_ptr() == embed.data_ptr():
+        raise ValueError("trainable_token_indices names lm_head but the head is tied to embed_tokens")
+
+
+def build_lora_config(peft, spec: Dict[str, Any], regex: str, model, tokenizer):
+    """The LoraConfig of a job; `trainable_token_indices` passes through to peft
+    (only the listed rows train and are stored in the adapter, as a delta over
+    the frozen matrix; every other row cannot move)."""
+    pc = spec["peft"]
+    kwargs: Dict[str, Any] = {}
+    indices = resolve_token_indices(spec.get("trainable_token_indices"))
+    if indices:
+        check_extended_vocab(model, tokenizer, indices)
+        kwargs["trainable_token_indices"] = indices
+    return peft.LoraConfig(
+        r=int(pc["rank"]), lora_alpha=int(pc["alpha"]), target_modules=regex, bias="none", **kwargs
+    )
+
+
 def resolve_lora_regex(spec: Dict[str, Any], model_type: str, module_names: List[str]) -> str:
     """Explicit regex wins; else the per-architecture default; else refuse."""
     import re
@@ -246,9 +309,7 @@ def run(spec: Dict[str, Any], emit: Callable[[Dict[str, Any]], None]) -> None:
     base_model = load_base()
     model_type = base_model.config.model_type
     regex = resolve_lora_regex(spec, model_type, [n for n, _ in base_model.named_modules()])
-    lora_cfg = peft.LoraConfig(
-        r=int(pc["rank"]), lora_alpha=int(pc["alpha"]), target_modules=regex, bias="none"
-    )
+    lora_cfg = build_lora_config(peft, spec, regex, base_model, tokenizer)
     model = peft.get_peft_model(base_model, lora_cfg)
     params = [p for p in model.parameters() if p.requires_grad]
     trainable = sum(p.numel() for p in params)

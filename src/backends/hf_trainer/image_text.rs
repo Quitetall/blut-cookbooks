@@ -9,6 +9,7 @@
 //! The struct is `#[serde(flatten)]`ed into both the stage `Args` and the
 //! wire `HfTrainerJob`, so on the wire these are ordinary top-level keys.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,31 @@ fn is_default_arch(a: &String) -> bool {
 fn is_false(b: &bool) -> bool {
     !*b
 }
+
+/// Rows of one matrix: an explicit id list, or the half-open range
+/// `{"start": a, "end": b}` (a vocabulary extension is one contiguous block,
+/// and 2,496 ids per matrix would bloat the stage cache key and the wire spec).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum TokenRows {
+    Ids(Vec<u32>),
+    Range { start: u32, end: u32 },
+}
+
+impl TokenRows {
+    pub fn len(&self) -> usize {
+        match self {
+            TokenRows::Ids(v) => v.len(),
+            TokenRows::Range { start, end } => end.saturating_sub(*start) as usize,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Modules whose rows `trainable_token_indices` may name.
+pub const TOKEN_TARGETS: [&str; 2] = ["embed_tokens", "lm_head"];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImageTextOpts {
@@ -83,6 +109,14 @@ pub struct ImageTextOpts {
     /// `task = "merge"` only: the adapter directory to fold into the base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter_path: Option<PathBuf>,
+    /// Train only these rows of `embed_tokens` and/or `lm_head` (peft
+    /// `trainable_token_indices`), for a base whose vocabulary was extended
+    /// before training. The base snapshot must already be the extended one
+    /// (tokenizer and matrices of equal length; the trainer checks and never
+    /// resizes). Only the rows train and are stored in the adapter; the other
+    /// rows cannot move. Keys: `embed_tokens`, `lm_head` (untied heads only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trainable_token_indices: Option<BTreeMap<String, TokenRows>>,
 }
 
 impl Default for ImageTextOpts {
@@ -104,6 +138,7 @@ impl Default for ImageTextOpts {
             checkpoint_root: None,
             verify_reload: None,
             adapter_path: None,
+            trainable_token_indices: None,
         }
     }
 }
@@ -174,6 +209,22 @@ impl ImageTextOpts {
         {
             return Err("lora_target_regex must be non-empty when set".into());
         }
+        if let Some(map) = &self.trainable_token_indices {
+            if map.is_empty() {
+                return Err("trainable_token_indices must name a module when set".into());
+            }
+            for (name, rows) in map {
+                if !TOKEN_TARGETS.contains(&name.as_str()) {
+                    return Err(format!(
+                        "trainable_token_indices key '{name}' must be one of {}",
+                        TOKEN_TARGETS.join("|")
+                    ));
+                }
+                if rows.is_empty() {
+                    return Err(format!("trainable_token_indices['{name}'] is empty"));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -199,6 +250,10 @@ impl ImageTextOpts {
         add(self.checkpoint_root.is_some(), "checkpoint_root");
         add(self.verify_reload.is_some(), "verify_reload");
         add(self.adapter_path.is_some(), "adapter_path");
+        add(
+            self.trainable_token_indices.is_some(),
+            "trainable_token_indices",
+        );
         v
     }
 }
@@ -233,7 +288,8 @@ mod tests {
             "keep_checkpoints": 2, "resume": true, "dataset_shards": ["/a", "/b"],
             "shuffle_buffer": 64, "max_steps": 9, "logging_steps": 1,
             "base_sha256": "ab", "checkpoint_root": "/c", "verify_reload": false,
-            "adapter_path": "/d"
+            "adapter_path": "/d",
+            "trainable_token_indices": {"embed_tokens": {"start": 5, "end": 9}, "lm_head": [5, 6]}
         });
         let o: ImageTextOpts = serde_json::from_value(v.clone()).unwrap();
         assert!(o.is_image_text() && o.resume);
@@ -314,5 +370,37 @@ mod tests {
         for o in bad {
             assert!(o.validate("lora", &none()).is_err(), "{o:?}");
         }
+    }
+
+    #[test]
+    fn token_indices_validate_and_stay_image_text_only() {
+        let it = ImageTextOpts {
+            arch: "image_text".into(),
+            ..Default::default()
+        };
+        let with = |k: &str, rows: TokenRows| ImageTextOpts {
+            trainable_token_indices: Some(BTreeMap::from([(k.to_string(), rows)])),
+            ..it.clone()
+        };
+        let ok = with("embed_tokens", TokenRows::Range { start: 3, end: 5 });
+        assert!(ok.validate("lora", &none()).is_ok());
+        assert_eq!(TokenRows::Range { start: 3, end: 5 }.len(), 2);
+        for bad in [
+            with("model.embed_tokens", TokenRows::Ids(vec![1])),
+            with("lm_head", TokenRows::Ids(vec![])),
+            with("lm_head", TokenRows::Range { start: 4, end: 4 }),
+            ImageTextOpts {
+                trainable_token_indices: Some(BTreeMap::new()),
+                ..it.clone()
+            },
+        ] {
+            assert!(bad.validate("lora", &none()).is_err(), "{bad:?}");
+        }
+        let causal = ImageTextOpts {
+            trainable_token_indices: ok.trainable_token_indices.clone(),
+            ..Default::default()
+        };
+        let e = causal.validate("lora", &none()).unwrap_err();
+        assert!(e.contains("trainable_token_indices"), "{e}");
     }
 }
