@@ -16,7 +16,7 @@ pub mod runner;
 pub mod stages;
 pub mod venv;
 
-pub use image_text::{ARCH_CAUSAL_LM, ARCH_IMAGE_TEXT, ImageTextOpts};
+pub use image_text::{ARCH_CAUSAL_LM, ARCH_IMAGE_TEXT, ImageTextOpts, TOKEN_TARGETS, TokenRows};
 pub use runner::{DpoConfig, HfRunArtifact, HfTrainerJob, HfTrainerRunner, PeftConfig, StatusLine};
 pub use stages::{HfDpoTrain, HfSftTrain};
 pub use venv::{
